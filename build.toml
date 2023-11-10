@@ -1,0 +1,3 @@
+[Targets.Example-1]
+Srcs = ["example_srcs/lib.c"]
+Hdrs = ["example_srcs/lib.h"]
