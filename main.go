@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +24,21 @@ var (
 	dctx *DoContext
 )
 
+func apply[U any, V any](iterable []U, fx func(U)V) []V {
+	var v []V = make([]V, 0)
+	for _, u := range iterable {
+		v = append(v, fx(u))
+	}
+	return v
+}
+
+func convert_path_to_artifact(path string) *Artifact {
+	return &Artifact{
+		dir: filepath.Dir(path),
+		fname: filepath.Base(path),
+	}
+}
+
 func is_file(filename string) bool {
 	stat, err := os.Stat(filename)
 	if  err != nil {
@@ -35,6 +51,7 @@ type TargetConfig struct {
 	Name string
 	Srcs []string
 	Hdrs []string
+	Deps []string
 	// The target type that should be build.
 	// For library, this can be "static" or "dynamic".
 	// For binary, set to "binary".
@@ -58,18 +75,58 @@ func (t *TargetConfig) Validate() error {
 // The build tree should properly construct the build step for each
 // unit that needs to be built in order for this specific target to
 // successfully build.
-func (t *TargetConfig) ConstructBuildTree(dctx *DoContext) (*BuildStep, error) {
-	// TODO: Handle build dependencies.
+func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*BuildStep, error) {
 
+	// Construct the build subtree for the dependants
+	var deps_buildsteps []*BuildStep = make([]*BuildStep, 0)
+	for _, depname := range t.Deps {
+		depcfg, err := tp.FindTarget(depname)
+		if err != nil {
+			return nil, err
+		}
+		dep_buildstep, err := depcfg.ConstructBuildTree(dctx, tp)
+		if err != nil {
+			return nil, err
+		}
+		deps_buildsteps = append(deps_buildsteps, dep_buildstep)	
+	}
+
+	var err error
+	var bs *BuildStep
 	switch (t.Type) {
 	case "static":
-		return t.static_build_step(dctx)
+		bs, err = t.static_build_step(dctx)
 	case "dynamic":
 		return nil, fmt.Errorf("Dynamic build unimplemented.")	
 	case "binary":
+		bs, err = t.binary_build_step(dctx)
 	default:
+		return nil, fmt.Errorf("Unknown target type: %s", t.Type)
 	}
-	return nil, fmt.Errorf("Unknown target type: %s", t.Type)
+
+	if err != nil {
+		return nil, err
+	}
+	if bs == nil {
+		panic("Build step not set during construction of build tree.")
+	}
+
+	bs.dependants = deps_buildsteps
+	return bs, nil
+}
+
+func (t *TargetConfig) binary_build_step(dctx *DoContext) (*BuildStep, error) {
+	binfils_bs := &BuildSubStep{
+		inputs: apply(t.Srcs, convert_path_to_artifact),
+		outputs: []*Artifact{ &Artifact{ dir: dctx.builddir_path, fname: t.Name } },
+		action: ProduceBinary,
+		action_fn: build_binary,
+	}
+	
+	bs := &BuildStep{
+		steps: binfils_bs,
+	}
+	return bs, nil
 }
 
 func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
@@ -78,15 +135,17 @@ func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
 	// Step 2: Use ar to product the library from the produced object fles.
 
 	objfile_bs := &BuildSubStep{
-		inputs: t.Srcs,
-		outputs: []string{filepath.Join(dctx.builddir_path, fmt.Sprintf("%s.o", t.Name))},
+		inputs: apply(t.Srcs, convert_path_to_artifact),
+		outputs: []*Artifact{ &Artifact {dir: dctx.builddir_path, fname: fmt.Sprintf("%s.o", t.Name)} },
 		action: ProduceObject,
+		action_fn: build_object,
 	}
 
 	libfile_bs := &BuildSubStep{
 		inputs: objfile_bs.outputs,
-		outputs: []string{filepath.Join(dctx.builddir_path, fmt.Sprintf("%s.a", t.Name))},
+		outputs: []*Artifact{ &Artifact {dir: dctx.builddir_path, fname: fmt.Sprintf("%s.a", t.Name)} },
 		action: UseArToProduceStaticLib,
+		action_fn: produce_static_lib,
 	}
 	objfile_bs.next = libfile_bs
 
@@ -151,54 +210,96 @@ type SubStepAction int64
 const (
 	ProduceObject SubStepAction = 0
 	UseArToProduceStaticLib = 1
+	ProduceBinary = 2
 )
 
 type BuildSubStep struct {
-	inputs []string
-	outputs []string
+	inputs []*Artifact
+	outputs []*Artifact
+	
+	// TODO: Deprecate the action enum.
+	// The action_fn is sufficient for executing the right build
+	// step action.
 	action SubStepAction
+	action_fn func(*BuildStep, *BuildSubStep, *DoContext) error
 	next *BuildSubStep
 }
 
-func (bss *BuildSubStep) Build(dctx *DoContext) error {
-	switch bss.action {
-	case ProduceObject:
-		return bss.build_object(dctx)
-	case UseArToProduceStaticLib:
-		return bss.produce_static_lib(dctx)
-	}
-	return fmt.Errorf("Unimplemented build step action: %v", bss.action)
+func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) error {
+	return bss.action_fn(bs, bss, dctx)
 }
 
-func (bss *BuildSubStep) build_object(dctx *DoContext) error {
+func build_binary(bs *BuildStep, bss  *BuildSubStep, dctx *DoContext) error {
+	if len(bss.outputs) != 1 {
+		return fmt.Errorf("Incorrect # of outputs for binary build: %d, expects 1", len(bss.outputs))
+	}
+
+	// TODO: Appending exe to the produced binary so that windows will know how to handle the file.
+	// This is not portable and is only windows specific. Abstract this away so that the filename
+	// decision is more intuitive based on the operating system and the type of object being built.
+	outbin := bss.outputs[0]
+	exepath := fmt.Sprintf("%s.exe", outbin.Fullpath())
+	cmd := []string {dctx.c_compiler, "-o", exepath}
+	cmd = append(cmd, apply(bss.inputs, func (a *Artifact) string { return a.Fullpath() })...)
+
+	// Collect the artifacts from the dependants and append it to the command.
+	// This assumes that every dependant build step produces a static library.
+	var static_libs []*Artifact = make([]*Artifact, 0)
+	for _, dep_bs := range bs.dependants {
+		static_libs = append(static_libs, dep_bs.output_artifacts...)
+	}
+
+	for _, static_lib := range static_libs {
+		cmd = append(cmd, fmt.Sprintf("-L%s", static_lib.dir), fmt.Sprintf("-l:%s", static_lib.fname))
+	}
+
+	logger.Debug().Msgf("Binary Build command: %#v", cmd)
+
+	var errb bytes.Buffer
+	excmd := exec.Command(cmd[0], cmd[1:]...)
+	excmd.Stderr = &errb
+
+	out, err := excmd.Output()
+	if err != nil {
+		return fmt.Errorf("%v, stderr = %s", err, errb.String())
+	}
+	logger.Debug().Msgf("Build command output: %s", string(out))
+	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Binary built"),  color.New(color.FgGreen).SprintFunc()(outbin.Fullpath()))
+	return nil
+}
+
+func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) error {
 	if len(bss.outputs) != 1 {
 		return fmt.Errorf("Incorrect # of outputs for object build: %d, expects 1", len(bss.outputs))
 	}
 	
 	outobj := bss.outputs[0]
-	cmd := []string {dctx.c_compiler, "-c", "-o", outobj}
-	cmd = append(cmd, bss.inputs...)
+	cmd := []string {dctx.c_compiler, "-c", "-o", outobj.Fullpath()}
+	cmd = append(cmd, apply(bss.inputs, func (a *Artifact) string { return a.Fullpath() })...)
 
 	logger.Debug().Msgf("Object Build command: %#v", cmd)
 
+	var errb bytes.Buffer
 	excmd := exec.Command(cmd[0], cmd[1:]...)
+	excmd.Stderr = &errb
+
 	out, err := excmd.Output()
 	if err != nil {
-		return err
+		return fmt.Errorf("%v, stderr = %s", err, errb.String())
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Object built"),  color.New(color.FgGreen).SprintFunc()(outobj))
+	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Object built"),  color.New(color.FgGreen).SprintFunc()(outobj.Fullpath()))
 	return nil
 }
 
-func (bss *BuildSubStep) produce_static_lib(dctx *DoContext) error {
+func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) error {
 	if len(bss.outputs) != 1 {
 		return fmt.Errorf("Incorrect # of outputs for static lib build: %d, expects 1", len(bss.outputs))
 	}
 
-	outlib := bss.outputs[0]
-	cmd := []string {dctx.ar, "rcs", outlib}
-	cmd = append(cmd, bss.inputs...)
+	var outlib *Artifact = bss.outputs[0]
+	cmd := []string {dctx.ar, "rcs", outlib.Fullpath()}
+	cmd = append(cmd, apply(bss.inputs, func (a *Artifact) string { return a.Fullpath() })...)
 
 	logger.Debug().Msgf("Static Lib Build Command: %#v", cmd)
 	
@@ -208,8 +309,20 @@ func (bss *BuildSubStep) produce_static_lib(dctx *DoContext) error {
 		return err
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Static library built"),  color.New(color.FgGreen).SprintFunc()(outlib))
+	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Static library built"),  color.New(color.FgGreen).SprintFunc()(outlib.Fullpath()))
 	return nil
+}
+
+// An artifact is a product of a build step.
+type Artifact struct {
+	// The directory that the artifact is stored in.
+	dir string
+	// The filename of the artifact within the directory.
+	fname string
+}
+
+func (a *Artifact) Fullpath() string {
+	return filepath.Join(a.dir, a.fname)
 }
 
 // Build step define how to build a specific transition unit
@@ -220,9 +333,9 @@ type BuildStep struct {
 
 	// The list of artifacts produced by the build step.
 	// This is populated after the build step is executed.
-	output_artifacts_path []string
+	output_artifacts []*Artifact
 	steps *BuildSubStep
-	dependants *[]BuildStep
+	dependants []*BuildStep
 }
 
 func (bs *BuildStep) Build(dctx *DoContext) error {
@@ -230,14 +343,46 @@ func (bs *BuildStep) Build(dctx *DoContext) error {
 		return fmt.Errorf("Nothing to build")
 	}
 
-	var err error
-	var bss *BuildSubStep = bs.steps
-	for bss != nil {
-		err = bss.Build(dctx)
-		if err != nil {
-			return err
+	// Construct the build queue.
+	// Should be constructed as a tree, but for simplicity,
+	// implement as a queue for now.
+	var bfsq []*BuildStep
+	var build_queue []*BuildStep
+	bfsq = append(bfsq, bs)
+
+	for len(bfsq) > 0 {
+		next := bfsq[0]
+		bfsq = bfsq[1:]
+
+		build_queue = append(build_queue, next)
+		for _, child := range next.dependants {
+			bfsq = append(bfsq, child)
 		}
-		bss = bss.next
+	}
+
+	// Execute the build queue backwards.
+	var err error
+	var index int = len(build_queue) - 1
+	for index >= 0 {
+
+		var curr_bs *BuildStep = build_queue[index]
+		var bss *BuildSubStep = curr_bs.steps
+		for bss != nil {
+			err = bss.Build(bs,dctx)
+			if err != nil {
+				return err
+			}
+
+			// When we have reached the final build substep of the build step,
+			// The outputs of the build substep should be the final exported
+			// artifacts for this step.
+			if bss.next == nil {
+				curr_bs.output_artifacts = bss.outputs
+			}
+
+			bss = bss.next
+		}
+		index -= 1
 	}
 	return nil	
 }
@@ -267,7 +412,7 @@ func build(dctx *DoContext, args []string) error {
 		return err
 	}
 
-	btree, err := tinfo.ConstructBuildTree(dctx)
+	btree, err := tinfo.ConstructBuildTree(dctx, tp)
 	if err != nil {
 		return err
 	}

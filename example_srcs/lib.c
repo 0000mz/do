@@ -1,6 +1,3 @@
-#include <stdio.h>
+#include "example_srcs/lib.h"
 
-int main() {
-  printf("Hello world.\n");
-  return 0;
-}
+int add(int a, int b) { return a + b + 1; }

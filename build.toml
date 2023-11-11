@@ -2,3 +2,8 @@
 Srcs = ["example_srcs/lib.c"]
 Hdrs = ["example_srcs/lib.h"]
 Type = "static"
+
+[Targets.my_binary]
+Srcs = ["example_srcs/main.c"]
+Deps = ["my_library"]
+Type = "binary"
