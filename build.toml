@@ -1,3 +1,4 @@
-[Targets.Example-1]
+[Targets.my_library]
 Srcs = ["example_srcs/lib.c"]
 Hdrs = ["example_srcs/lib.h"]
+Type = "static"

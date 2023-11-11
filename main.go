@@ -20,6 +20,7 @@ import (
 var (
 	logger zerolog.Logger
 	logfile *os.File
+	dctx *DoContext
 )
 
 func is_file(filename string) bool {
@@ -31,8 +32,13 @@ func is_file(filename string) bool {
 }
 
 type TargetConfig struct {
+	Name string
 	Srcs []string
 	Hdrs []string
+	// The target type that should be build.
+	// For library, this can be "static" or "dynamic".
+	// For binary, set to "binary".
+	Type string
 }
 
 // Validate that all of the information in the target is valid.
@@ -48,10 +54,46 @@ func (t *TargetConfig) Validate() error {
 	return nil
 }
 
-// Return the build command for building the specified target.
-func (t *TargetConfig) BuildCmd() []string {
-	var cmd []string = []string{"gcc"}
-	return append(cmd, t.Srcs...)
+// Constuct a build tree for th is target.
+// The build tree should properly construct the build step for each
+// unit that needs to be built in order for this specific target to
+// successfully build.
+func (t *TargetConfig) ConstructBuildTree(dctx *DoContext) (*BuildStep, error) {
+	// TODO: Handle build dependencies.
+
+	switch (t.Type) {
+	case "static":
+		return t.static_build_step(dctx)
+	case "dynamic":
+		return nil, fmt.Errorf("Dynamic build unimplemented.")	
+	case "binary":
+	default:
+	}
+	return nil, fmt.Errorf("Unknown target type: %s", t.Type)
+}
+
+func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
+	// Static build takes 2 steps:
+	// Step 1: build the object files with the compiler.
+	// Step 2: Use ar to product the library from the produced object fles.
+
+	objfile_bs := &BuildSubStep{
+		inputs: t.Srcs,
+		outputs: []string{filepath.Join(dctx.builddir_path, fmt.Sprintf("%s.o", t.Name))},
+		action: ProduceObject,
+	}
+
+	libfile_bs := &BuildSubStep{
+		inputs: objfile_bs.outputs,
+		outputs: []string{filepath.Join(dctx.builddir_path, fmt.Sprintf("%s.a", t.Name))},
+		action: UseArToProduceStaticLib,
+	}
+	objfile_bs.next = libfile_bs
+
+	bs := &BuildStep{
+		steps: objfile_bs,
+	}
+	return bs, nil
 }
 
 type TargetParser struct {
@@ -86,6 +128,7 @@ stat, err := os.Stat(config_file)
 		targets: make(map[string]TargetConfig),
 	}
 	for tname, tinfo := range targetcfg.Targets {
+		tinfo.Name = tname
 		tparser.targets[tname] = tinfo
 	}
 	logger.Debug().Msgf("tparser: %#v", tparser)
@@ -104,8 +147,103 @@ func (t *TargetParser) FindTarget(target_name string) (*TargetConfig, error) {
 	return nil, fmt.Errorf("No target found with name: %s", target_name)
 }
 
+type SubStepAction int64
+const (
+	ProduceObject SubStepAction = 0
+	UseArToProduceStaticLib = 1
+)
+
+type BuildSubStep struct {
+	inputs []string
+	outputs []string
+	action SubStepAction
+	next *BuildSubStep
+}
+
+func (bss *BuildSubStep) Build(dctx *DoContext) error {
+	switch bss.action {
+	case ProduceObject:
+		return bss.build_object(dctx)
+	case UseArToProduceStaticLib:
+		return bss.produce_static_lib(dctx)
+	}
+	return fmt.Errorf("Unimplemented build step action: %v", bss.action)
+}
+
+func (bss *BuildSubStep) build_object(dctx *DoContext) error {
+	if len(bss.outputs) != 1 {
+		return fmt.Errorf("Incorrect # of outputs for object build: %d, expects 1", len(bss.outputs))
+	}
+	
+	outobj := bss.outputs[0]
+	cmd := []string {dctx.c_compiler, "-c", "-o", outobj}
+	cmd = append(cmd, bss.inputs...)
+
+	logger.Debug().Msgf("Object Build command: %#v", cmd)
+
+	excmd := exec.Command(cmd[0], cmd[1:]...)
+	out, err := excmd.Output()
+	if err != nil {
+		return err
+	}
+	logger.Debug().Msgf("Build command output: %s", string(out))
+	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Object built"),  color.New(color.FgGreen).SprintFunc()(outobj))
+	return nil
+}
+
+func (bss *BuildSubStep) produce_static_lib(dctx *DoContext) error {
+	if len(bss.outputs) != 1 {
+		return fmt.Errorf("Incorrect # of outputs for static lib build: %d, expects 1", len(bss.outputs))
+	}
+
+	outlib := bss.outputs[0]
+	cmd := []string {dctx.ar, "rcs", outlib}
+	cmd = append(cmd, bss.inputs...)
+
+	logger.Debug().Msgf("Static Lib Build Command: %#v", cmd)
+	
+	excmd := exec.Command(cmd[0], cmd[1:]...)
+	out, err := excmd.Output()
+	if err != nil {
+		return err
+	}
+	logger.Debug().Msgf("Build command output: %s", string(out))
+	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Static library built"),  color.New(color.FgGreen).SprintFunc()(outlib))
+	return nil
+}
+
+// Build step define how to build a specific transition unit
+// and has information on the artifacts produced from the build step.
+// It also contains the children that need to be built before this step
+// can properly be built.
+type BuildStep struct {
+
+	// The list of artifacts produced by the build step.
+	// This is populated after the build step is executed.
+	output_artifacts_path []string
+	steps *BuildSubStep
+	dependants *[]BuildStep
+}
+
+func (bs *BuildStep) Build(dctx *DoContext) error {
+	if bs.steps == nil {
+		return fmt.Errorf("Nothing to build")
+	}
+
+	var err error
+	var bss *BuildSubStep = bs.steps
+	for bss != nil {
+		err = bss.Build(dctx)
+		if err != nil {
+			return err
+		}
+		bss = bss.next
+	}
+	return nil	
+}
+
 // Build the requested target.
-func build(args []string) error {
+func build(dctx *DoContext, args []string) error {
 	var target_name string
 
 	if len(args) == 0 {
@@ -129,28 +267,20 @@ func build(args []string) error {
 		return err
 	}
 
-	buildcmd := tinfo.BuildCmd()
-	logger.Debug().Msgf("Build command for target %s: %s", target_name, buildcmd)
-
-	builddir, err := os.MkdirTemp("", "")
+	btree, err := tinfo.ConstructBuildTree(dctx)
 	if err != nil {
 		return err
 	}
-	outexe := fmt.Sprintf("%s/a", builddir)
-	logger.Info().Msgf("Building target to file: %s", outexe)
-	buildcmd = append(buildcmd, "-o")
-	buildcmd = append(buildcmd, outexe)
 
-	cmd := exec.Command(buildcmd[0], buildcmd[1:]...)
-	out, err := cmd.Output()
+	err = btree.Build(dctx)
 	if err != nil {
 		return err
 	}
-	logger.Debug().Msgf("Build command output: %s", string(out))
-
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Build Output"),  color.New(color.FgGreen).SprintFunc()(filepath.Join(outexe)))
-
 	return nil
+}
+
+func clean(dctx *DoContext) error {
+	return os.RemoveAll(dctx.builddir_path)
 }
 
 // Check if the program's argument list contains the specified argname prefixed
@@ -175,6 +305,34 @@ func get_arg_value (argkey string) (string, error) {
 		return strings.Join(parts[1:], "="), nil
 	}
 	return "", fmt.Errorf("No kv arg for key: %s", argkey)
+}
+
+type DoContext struct {
+	builddir_path string
+	c_compiler string
+	ar string
+}
+
+// Setup the do-build directory in the root of the project.
+// The root of the project expects a build.toml file.
+func setup_core_dirs(dctx *DoContext) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	buildfile_path := filepath.Join(cwd, "build.toml") 
+	if !is_file(buildfile_path) {
+		return fmt.Errorf("No buildfile found at %s", buildfile_path)
+	}
+
+	dctx.builddir_path = filepath.Join(cwd, ".do-build")
+	err = os.Mkdir(dctx.builddir_path, os.ModeDir)
+	if err != nil {
+		return err
+	}
+	logger.Debug().Msgf("Created core build directory: %s", dctx.builddir_path)	
+	return nil
 }
 
 func init() {
@@ -235,10 +393,18 @@ func main() {
 	action := os.Args[1]
 	fmt.Printf("%s %s\n", color.New(color.FgCyan).SprintFunc()("do"),  color.New(color.FgGreen).SprintFunc()(action))
 
+	dctx = &DoContext{
+		c_compiler: "gcc",
+		ar: "ar",
+	}
+	setup_core_dirs(dctx)
+	
 	var err error
 	switch action {
 	case "build":
-		err = build(os.Args[2:])
+		err = build(dctx, os.Args[2:])
+	case "clean":
+		err = clean(dctx)
 	default:
 		err = fmt.Errorf("Unknown action: %s\n", action)
 	}
