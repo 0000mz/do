@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -19,12 +20,22 @@ import (
 )
 
 var (
-	logger zerolog.Logger
+	logger  zerolog.Logger
 	logfile *os.File
-	dctx *DoContext
+	dctx    *DoContext
 )
 
-func apply[U any, V any](iterable []U, fx func(U)V) []V {
+func filter[T any](t []T, f func(T) bool) []T {
+	var u []T = make([]T, 0)
+	for _, el := range t {
+		if f(el) {
+			u = append(u, el)
+		}
+	}
+	return u
+}
+
+func apply[U any, V any](iterable []U, fx func(U) V) []V {
 	var v []V = make([]V, 0)
 	for _, u := range iterable {
 		v = append(v, fx(u))
@@ -34,14 +45,14 @@ func apply[U any, V any](iterable []U, fx func(U)V) []V {
 
 func convert_path_to_artifact(path string) *Artifact {
 	return &Artifact{
-		dir: filepath.Dir(path),
+		dir:   filepath.Dir(path),
 		fname: filepath.Base(path),
 	}
 }
 
 func is_file(filename string) bool {
 	stat, err := os.Stat(filename)
-	if  err != nil {
+	if err != nil {
 		return false
 	}
 	return !stat.IsDir()
@@ -88,20 +99,20 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 		if err != nil {
 			return nil, err
 		}
-		deps_buildsteps = append(deps_buildsteps, dep_buildstep)	
+		deps_buildsteps = append(deps_buildsteps, dep_buildstep)
 	}
 
 	var err error
 	var bs *BuildStep
-	switch (t.Type) {
+	switch t.Type {
 	case "static":
 		bs, err = t.static_build_step(dctx)
 	case "dynamic":
-		return nil, fmt.Errorf("Dynamic build unimplemented.")	
+		return nil, fmt.Errorf("dynamic build unimplemented")
 	case "binary":
 		bs, err = t.binary_build_step(dctx)
 	default:
-		return nil, fmt.Errorf("Unknown target type: %s", t.Type)
+		return nil, fmt.Errorf("unknown target type: %s", t.Type)
 	}
 
 	if err != nil {
@@ -112,20 +123,46 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 	}
 
 	bs.dependants = deps_buildsteps
+	// Set the parent for for eahc of the deps to the bs
+	for _, dep := range bs.dependants {
+		dep.parent = bs
+		dep.promotion_fn = func(curr_bs *BuildStep) bool {
+			dctx.build_tree_state_mu.Lock()
+			defer dctx.build_tree_state_mu.Unlock()
+
+			if curr_bs.parent == nil {
+				return false
+			}
+
+			return len(filter(
+				apply(
+					curr_bs.parent.dependants,
+					func(bs *BuildStep) bool { return bs.build_complete },
+				),
+				func(complete bool) bool { return !complete })) == 0
+		}
+	}
 	return bs, nil
+}
+
+func NewBuildStep() *BuildStep {
+	return &BuildStep{
+		promotion_fn:   func(_ *BuildStep) bool { return false },
+		build_complete: false,
+	}
 }
 
 func (t *TargetConfig) binary_build_step(dctx *DoContext) (*BuildStep, error) {
 	binfils_bs := &BuildSubStep{
-		inputs: apply(t.Srcs, convert_path_to_artifact),
-		outputs: []*Artifact{ &Artifact{ dir: dctx.builddir_path, fname: t.Name } },
-		action: ProduceBinary,
+		inputs:    apply(t.Srcs, convert_path_to_artifact),
+		outputs:   []*Artifact{{dir: dctx.builddir_path, fname: t.Name}},
+		action:    ProduceBinary,
 		action_fn: build_binary,
 	}
-	
-	bs := &BuildStep{
-		steps: binfils_bs,
-	}
+
+	bs := NewBuildStep()
+	bs.steps = binfils_bs
+
 	return bs, nil
 }
 
@@ -135,23 +172,23 @@ func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
 	// Step 2: Use ar to product the library from the produced object fles.
 
 	objfile_bs := &BuildSubStep{
-		inputs: apply(t.Srcs, convert_path_to_artifact),
-		outputs: []*Artifact{ &Artifact {dir: dctx.builddir_path, fname: fmt.Sprintf("%s.o", t.Name)} },
-		action: ProduceObject,
+		inputs:    apply(t.Srcs, convert_path_to_artifact),
+		outputs:   []*Artifact{{dir: dctx.builddir_path, fname: fmt.Sprintf("%s.o", t.Name)}},
+		action:    ProduceObject,
 		action_fn: build_object,
 	}
 
 	libfile_bs := &BuildSubStep{
-		inputs: objfile_bs.outputs,
-		outputs: []*Artifact{ &Artifact {dir: dctx.builddir_path, fname: fmt.Sprintf("%s.a", t.Name)} },
-		action: UseArToProduceStaticLib,
+		inputs:    objfile_bs.outputs,
+		outputs:   []*Artifact{{dir: dctx.builddir_path, fname: fmt.Sprintf("%s.a", t.Name)}},
+		action:    UseArToProduceStaticLib,
 		action_fn: produce_static_lib,
 	}
 	objfile_bs.next = libfile_bs
 
-	bs := &BuildStep{
-		steps: objfile_bs,
-	}
+	bs := NewBuildStep()
+	bs.steps = objfile_bs
+
 	return bs, nil
 }
 
@@ -160,12 +197,12 @@ type TargetParser struct {
 }
 
 func NewTargetParser(config_file string) (*TargetParser, error) {
-stat, err := os.Stat(config_file)
-	if  err != nil {
+	stat, err := os.Stat(config_file)
+	if err != nil {
 		return nil, err
 	}
 	if stat.IsDir() {
-		return nil, fmt.Errorf("Config file is a directory: %s", config_file)
+		return nil, fmt.Errorf("config file is a directory: %s", config_file)
 	}
 
 	filedata, err := os.ReadFile(config_file)
@@ -181,7 +218,6 @@ stat, err := os.Stat(config_file)
 	if err != nil {
 		return nil, err
 	}
-
 
 	tparser := TargetParser{
 		targets: make(map[string]TargetConfig),
@@ -203,35 +239,36 @@ func (t *TargetParser) FindTarget(target_name string) (*TargetConfig, error) {
 			return &tcfg, nil
 		}
 	}
-	return nil, fmt.Errorf("No target found with name: %s", target_name)
+	return nil, fmt.Errorf("no target found with name: %s", target_name)
 }
 
 type SubStepAction int64
+
 const (
-	ProduceObject SubStepAction = 0
-	UseArToProduceStaticLib = 1
-	ProduceBinary = 2
+	ProduceObject           SubStepAction = 0
+	UseArToProduceStaticLib SubStepAction = 1
+	ProduceBinary           SubStepAction = 2
 )
 
 type BuildSubStep struct {
-	inputs []*Artifact
+	inputs  []*Artifact
 	outputs []*Artifact
-	
+
 	// TODO: Deprecate the action enum.
 	// The action_fn is sufficient for executing the right build
 	// step action.
-	action SubStepAction
+	action    SubStepAction
 	action_fn func(*BuildStep, *BuildSubStep, *DoContext) error
-	next *BuildSubStep
+	next      *BuildSubStep
 }
 
 func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) error {
 	return bss.action_fn(bs, bss, dctx)
 }
 
-func build_binary(bs *BuildStep, bss  *BuildSubStep, dctx *DoContext) error {
+func build_binary(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) error {
 	if len(bss.outputs) != 1 {
-		return fmt.Errorf("Incorrect # of outputs for binary build: %d, expects 1", len(bss.outputs))
+		return fmt.Errorf("incorrect # of outputs for binary build: %d, expects 1", len(bss.outputs))
 	}
 
 	// TODO: Appending exe to the produced binary so that windows will know how to handle the file.
@@ -239,8 +276,8 @@ func build_binary(bs *BuildStep, bss  *BuildSubStep, dctx *DoContext) error {
 	// decision is more intuitive based on the operating system and the type of object being built.
 	outbin := bss.outputs[0]
 	exepath := fmt.Sprintf("%s.exe", outbin.Fullpath())
-	cmd := []string {dctx.c_compiler, "-o", exepath}
-	cmd = append(cmd, apply(bss.inputs, func (a *Artifact) string { return a.Fullpath() })...)
+	cmd := []string{dctx.c_compiler, "-o", exepath}
+	cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
 
 	// Collect the artifacts from the dependants and append it to the command.
 	// This assumes that every dependant build step produces a static library.
@@ -264,18 +301,18 @@ func build_binary(bs *BuildStep, bss  *BuildSubStep, dctx *DoContext) error {
 		return fmt.Errorf("%v, stderr = %s", err, errb.String())
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Binary built"),  color.New(color.FgGreen).SprintFunc()(outbin.Fullpath()))
+	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Binary built"), color.New(color.FgGreen).SprintFunc()(outbin.Fullpath()))
 	return nil
 }
 
 func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) error {
 	if len(bss.outputs) != 1 {
-		return fmt.Errorf("Incorrect # of outputs for object build: %d, expects 1", len(bss.outputs))
+		return fmt.Errorf("incorrect # of outputs for object build: %d, expects 1", len(bss.outputs))
 	}
-	
+
 	outobj := bss.outputs[0]
-	cmd := []string {dctx.c_compiler, "-c", "-o", outobj.Fullpath()}
-	cmd = append(cmd, apply(bss.inputs, func (a *Artifact) string { return a.Fullpath() })...)
+	cmd := []string{dctx.c_compiler, "-c", "-o", outobj.Fullpath()}
+	cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
 
 	logger.Debug().Msgf("Object Build command: %#v", cmd)
 
@@ -288,28 +325,28 @@ func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) error {
 		return fmt.Errorf("%v, stderr = %s", err, errb.String())
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Object built"),  color.New(color.FgGreen).SprintFunc()(outobj.Fullpath()))
+	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Object built"), color.New(color.FgGreen).SprintFunc()(outobj.Fullpath()))
 	return nil
 }
 
 func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) error {
 	if len(bss.outputs) != 1 {
-		return fmt.Errorf("Incorrect # of outputs for static lib build: %d, expects 1", len(bss.outputs))
+		return fmt.Errorf("incorrect # of outputs for static lib build: %d, expects 1", len(bss.outputs))
 	}
 
 	var outlib *Artifact = bss.outputs[0]
-	cmd := []string {dctx.ar, "rcs", outlib.Fullpath()}
-	cmd = append(cmd, apply(bss.inputs, func (a *Artifact) string { return a.Fullpath() })...)
+	cmd := []string{dctx.ar, "rcs", outlib.Fullpath()}
+	cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
 
 	logger.Debug().Msgf("Static Lib Build Command: %#v", cmd)
-	
+
 	excmd := exec.Command(cmd[0], cmd[1:]...)
 	out, err := excmd.Output()
 	if err != nil {
 		return err
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Static library built"),  color.New(color.FgGreen).SprintFunc()(outlib.Fullpath()))
+	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Static library built"), color.New(color.FgGreen).SprintFunc()(outlib.Fullpath()))
 	return nil
 }
 
@@ -334,57 +371,105 @@ type BuildStep struct {
 	// The list of artifacts produced by the build step.
 	// This is populated after the build step is executed.
 	output_artifacts []*Artifact
-	steps *BuildSubStep
-	dependants []*BuildStep
+	steps            *BuildSubStep
+	dependants       []*BuildStep
+	parent           *BuildStep
+	// The promotion function will determine whether or not a build step can
+	// spawn the parent build step after it is complete. This is to facilitate
+	// the auto delegation of build actions starting from the leaf of the build
+	// tree up to the root of the build tree.
+	promotion_fn   func(*BuildStep) bool
+	build_complete bool
 }
 
-func (bs *BuildStep) Build(dctx *DoContext) error {
-	if bs.steps == nil {
-		return fmt.Errorf("Nothing to build")
+func (bs *BuildStep) Build(dctx *DoContext, errch chan error, completech chan bool) {
+	{
+		dctx.build_tree_state_mu.Lock()
+		if dctx.build_cancelled {
+			return
+		}
+		dctx.build_tree_state_mu.Unlock()
 	}
 
-	// Construct the build queue.
-	// Should be constructed as a tree, but for simplicity,
-	// implement as a queue for now.
-	var bfsq []*BuildStep
-	var build_queue []*BuildStep
-	bfsq = append(bfsq, bs)
+	var bss *BuildSubStep = bs.steps
+	for bss != nil {
+		err := bss.Build(bs, dctx)
+		if err != nil {
+			errch <- err
+			return
+		}
+		if bss.next == nil {
+			bs.output_artifacts = bss.outputs
+		}
+		bss = bss.next
+	}
 
-	for len(bfsq) > 0 {
-		next := bfsq[0]
-		bfsq = bfsq[1:]
+	{
+		dctx.build_tree_state_mu.Lock()
+		bs.build_complete = true
+		if dctx.build_cancelled {
+			return
+		}
+		dctx.build_tree_state_mu.Unlock()
+	}
 
-		build_queue = append(build_queue, next)
-		for _, child := range next.dependants {
-			bfsq = append(bfsq, child)
+	// Check if this build can be promoted to the next level of the tree.
+	if bs.promotion_fn(bs) {
+		logger.Debug().Msg("Promoting build to next level.")
+		go bs.parent.Build(dctx, errch, completech)
+	}
+
+	// Check if this is the last step of the build tree.
+	// If so, mark the full build as complete.
+	if bs.parent == nil {
+		completech <- true
+	}
+}
+
+// Execute the build tree recursively, starting from the leafs of the tree
+// up to the root of the tree.
+func start_build_tree(root *BuildStep, dctx *DoContext) error {
+	var leafs []*BuildStep = make([]*BuildStep, 0)
+
+	// Traverse the tree to find the leafs of the build tree.
+	var q []*BuildStep
+	q = append(q, root)
+
+	for len(q) > 0 {
+		next := q[0]
+		q = q[1:]
+
+		if len(next.dependants) == 0 {
+			leafs = append(leafs, next)
+		} else {
+			q = append(q, next.dependants...)
 		}
 	}
 
-	// Execute the build queue backwards.
-	var err error
-	var index int = len(build_queue) - 1
-	for index >= 0 {
-
-		var curr_bs *BuildStep = build_queue[index]
-		var bss *BuildSubStep = curr_bs.steps
-		for bss != nil {
-			err = bss.Build(bs,dctx)
-			if err != nil {
-				return err
-			}
-
-			// When we have reached the final build substep of the build step,
-			// The outputs of the build substep should be the final exported
-			// artifacts for this step.
-			if bss.next == nil {
-				curr_bs.output_artifacts = bss.outputs
-			}
-
-			bss = bss.next
-		}
-		index -= 1
+	var errch chan error = make(chan error)
+	var completech chan bool = make(chan bool)
+	for _, leaf := range leafs {
+		go leaf.Build(dctx, errch, completech)
 	}
-	return nil	
+
+	// Wait for all the builds to complete or an error to occur.
+	select {
+	case build_error := <-errch:
+		{
+			dctx.build_tree_state_mu.Lock()
+			dctx.build_cancelled = true
+			dctx.build_tree_state_mu.Unlock()
+		}
+
+		return build_error
+	case build_complete := <-completech:
+		if !build_complete {
+			panic("Unexpected build_complete value.")
+		}
+	}
+
+	fmt.Printf("Build Tree Completed!")
+	return nil
 }
 
 // Build the requested target.
@@ -392,7 +477,7 @@ func build(dctx *DoContext, args []string) error {
 	var target_name string
 
 	if len(args) == 0 {
-		return fmt.Errorf("No target name provided.")
+		return fmt.Errorf("no target name provided")
 	}
 	target_name = args[0]
 
@@ -417,7 +502,7 @@ func build(dctx *DoContext, args []string) error {
 		return err
 	}
 
-	err = btree.Build(dctx)
+	err = start_build_tree(btree, dctx)
 	if err != nil {
 		return err
 	}
@@ -430,7 +515,7 @@ func clean(dctx *DoContext) error {
 
 // Check if the program's argument list contains the specified argname prefixed
 // with two dashes: i.e. --argname
-func has_bool_arg (argname string) bool {
+func has_bool_arg(argname string) bool {
 	for _, arg := range os.Args[1:] {
 		if arg == fmt.Sprintf("--%s", argname) {
 			return true
@@ -441,21 +526,26 @@ func has_bool_arg (argname string) bool {
 
 // Get the value of a kv arg in the form "--key=value". Return the value if the
 // kv arg exists. Otherwise, return an error.
-func get_arg_value (argkey string) (string, error) {
+func get_arg_value(argkey string) (string, error) {
 	for _, arg := range os.Args[1:] {
 		parts := strings.Split(arg, "=")
-		if len(parts) < 2 || parts[0] != fmt.Sprintf("--%s", argkey)	{
+		if len(parts) < 2 || parts[0] != fmt.Sprintf("--%s", argkey) {
 			continue
 		}
 		return strings.Join(parts[1:], "="), nil
 	}
-	return "", fmt.Errorf("No kv arg for key: %s", argkey)
+	return "", fmt.Errorf("no kv arg for key: %s", argkey)
 }
 
 type DoContext struct {
 	builddir_path string
-	c_compiler string
-	ar string
+	c_compiler    string
+	ar            string
+
+	// Use this mutex to synchronize the access and modification of build
+	// tree state, i.e., build step completion state.
+	build_tree_state_mu *sync.Mutex
+	build_cancelled     bool
 }
 
 // Setup the do-build directory in the root of the project.
@@ -466,9 +556,9 @@ func setup_core_dirs(dctx *DoContext) error {
 		return err
 	}
 
-	buildfile_path := filepath.Join(cwd, "build.toml") 
+	buildfile_path := filepath.Join(cwd, "build.toml")
 	if !is_file(buildfile_path) {
-		return fmt.Errorf("No buildfile found at %s", buildfile_path)
+		return fmt.Errorf("no buildfile found at %s", buildfile_path)
 	}
 
 	dctx.builddir_path = filepath.Join(cwd, ".do-build")
@@ -476,7 +566,7 @@ func setup_core_dirs(dctx *DoContext) error {
 	if err != nil {
 		return err
 	}
-	logger.Debug().Msgf("Created core build directory: %s", dctx.builddir_path)	
+	logger.Debug().Msgf("Created core build directory: %s", dctx.builddir_path)
 	return nil
 }
 
@@ -502,7 +592,7 @@ func init() {
 	}
 
 	logger = zerolog.New(zerolog.ConsoleWriter{
-		Out: outlog,
+		Out:        outlog,
 		TimeFormat: time.RFC3339,
 	})
 
@@ -536,14 +626,17 @@ func main() {
 	}
 
 	action := os.Args[1]
-	fmt.Printf("%s %s\n", color.New(color.FgCyan).SprintFunc()("do"),  color.New(color.FgGreen).SprintFunc()(action))
+	fmt.Printf("%s %s\n", color.New(color.FgCyan).SprintFunc()("do"), color.New(color.FgGreen).SprintFunc()(action))
 
 	dctx = &DoContext{
 		c_compiler: "gcc",
-		ar: "ar",
+		ar:         "ar",
+
+		build_tree_state_mu: &sync.Mutex{},
+		build_cancelled:     false,
 	}
 	setup_core_dirs(dctx)
-	
+
 	var err error
 	switch action {
 	case "build":
@@ -551,7 +644,7 @@ func main() {
 	case "clean":
 		err = clean(dctx)
 	default:
-		err = fmt.Errorf("Unknown action: %s\n", action)
+		err = fmt.Errorf("unknown action: %s", action)
 	}
 
 	logger.Info().Msgf("err = %v", err)
