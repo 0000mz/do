@@ -5,5 +5,11 @@ Type = "static"
 
 [Targets.my_binary]
 Srcs = ["example_srcs/main.c"]
-Deps = ["my_library"]
+Deps = ["my_library", "zlib"]
 Type = "binary"
+
+[Targets.zlib]
+Git = "https://github.com/madler/zlib.git"
+Hash = "09155eaa2f9270dc4ed1fa13e2b4b2613e6e4851"
+Config = "make"
+Type = "external"

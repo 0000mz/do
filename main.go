@@ -190,6 +190,24 @@ func bytearr_equal(a []byte, b []byte) bool {
 	return true
 }
 
+func create_git_pull_buildstep(t *TargetConfig) (*BuildSubStep, error) {
+
+	if len(t.Git) == 0 || len(t.Hash) == 0 {
+		return nil, fmt.Errorf("no git remote or hash specified for git pull buildstep")
+	}
+
+	projname := filepath.Base(t.Git)
+	export_dir := filepath.Join(dctx.builddir_path, "external", fmt.Sprintf("%s-%s", projname, t.Hash))
+	bss := &BuildSubStep{
+		inputs:  []*Artifact{{Url: t.Git, Fname: t.Hash}},
+		outputs: []*Artifact{{Dir: export_dir}},
+		action_fn: func(bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
+			return nil, fmt.Errorf("git pull buildstep not implemented")
+		},
+	}
+	return bss, nil
+}
+
 // Determine if the `target`'s artifacts need to be refreshed.
 // The artifacts need to be refreshed if the files it depends on have a different
 // hash compared to the file hashes in the `cache`.
@@ -241,13 +259,27 @@ func compute_refresh(target *TargetConfig, cache *BuildCache) bool {
 }
 
 type TargetConfig struct {
-	Name string   `json:"name"`
+	Name string `json:"name"`
+
+	// List of source files and header files for this target to build.
+	// These files will be checked against to compare diffs between previous
+	// builds to determine whether to issue a rebuild of the target.
 	Srcs []string `json:"srcs"`
 	Hdrs []string `json:"hdrs"`
+
+	// External dependency target configuraton
+	Git    string `json:"git"`
+	Hash   string `json:"hash"`
+	Config string `json:"config"`
+
+	// List of targets that the target depends on.
+	// These targets need to be built before the current target can be
+	// built.
 	Deps []string `json:"deps"`
 	// The target type that should be build.
 	// For library, this can be "static" or "dynamic".
 	// For binary, set to "binary".
+	// For external, set to "external".
 	Type string `json:"-"`
 }
 
@@ -293,6 +325,8 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 		return nil, fmt.Errorf("dynamic build unimplemented")
 	case "binary":
 		bs, err = t.binary_build_step(dctx)
+	case "external":
+		bs, err = t.external_build_step(dctx)
 	default:
 		return nil, fmt.Errorf("unknown target type: %s", t.Type)
 	}
@@ -380,22 +414,37 @@ func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
 	// Step 1: build the object files with the compiler.
 	// Step 2: Use ar to product the library from the produced object fles.
 
-	objfile_bs := &BuildSubStep{
+	objfile_bss := &BuildSubStep{
 		inputs:    apply(t.Srcs, convert_path_to_artifact),
 		outputs:   []*Artifact{{Dir: dctx.builddir_path, Fname: fmt.Sprintf("%s.o", t.Name)}},
 		action_fn: build_object,
 	}
 
-	libfile_bs := &BuildSubStep{
-		inputs:    objfile_bs.outputs,
+	libfile_bss := &BuildSubStep{
+		inputs:    objfile_bss.outputs,
 		outputs:   []*Artifact{{Dir: dctx.builddir_path, Fname: fmt.Sprintf("%s.a", t.Name)}},
 		action_fn: produce_static_lib,
 	}
-	objfile_bs.next = libfile_bs
+	objfile_bss.next = libfile_bss
 
 	bs := NewBuildStep()
-	bs.steps = objfile_bs
+	bs.steps = objfile_bss
 
+	return bs, nil
+}
+
+func (t *TargetConfig) external_build_step(dctx *DoContext) (*BuildStep, error) {
+	// External build steps:
+	// 1. Pull the remote source.
+	// 2. Build the pulled source.
+
+	git_pull_bss, err := create_git_pull_buildstep(t)
+	if err != nil {
+		return nil, err
+	}
+
+	bs := NewBuildStep()
+	bs.steps = git_pull_bss
 	return bs, nil
 }
 
@@ -530,6 +579,8 @@ type Artifact struct {
 	Dir string `json:"dir"`
 	// The filename of the artifact within the directory.
 	Fname string `json:"fname"`
+	// The url where the artifact lives.
+	Url string `json:"url"`
 }
 
 func (a *Artifact) Exists() bool {
@@ -902,6 +953,8 @@ func (dctx *DoContext) SetupCoreDirs() error {
 	dctx.builddir_path = filepath.Join(cwd, ".do-build")
 	dctx.cachedir_path = filepath.Join(cwd, ".do-cache")
 	ensure_dir(dctx.builddir_path)
+	// External directory will be used for storing external dependencies.
+	ensure_dir(filepath.Join(dctx.builddir_path, "external"))
 	ensure_dir(dctx.cachedir_path)
 	return nil
 }
@@ -1033,6 +1086,7 @@ func main() {
 	}
 
 	logger.Info().Msgf("err = %v", err)
+	fmt.Printf("Error: %v\n", err)
 	exit_code := 0
 	if err != nil {
 		exit_code = 1
