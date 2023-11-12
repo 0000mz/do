@@ -19,6 +19,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/fatih/color"
+	"github.com/gosuri/uilive"
 	"github.com/rs/zerolog"
 )
 
@@ -27,6 +28,101 @@ var (
 	logfile *os.File
 	dctx    *DoContext
 )
+
+type BuildStateWriter struct {
+	// The number of state io to maange at a time.
+	state_io_ct int
+	writer      *uilive.Writer
+
+	// Keep tracks of the builds in progress.
+	builds map[string]bool
+	io_mu  *sync.Mutex
+
+	last_write_time time.Time
+}
+
+func NewBuildStateWriter(state_ct int) *BuildStateWriter {
+	return &BuildStateWriter{
+		state_io_ct: state_ct,
+		builds:      make(map[string]bool),
+		io_mu:       &sync.Mutex{},
+	}
+}
+
+func (io *BuildStateWriter) Start() {
+	io.writer = uilive.New()
+	io.writer.Start()
+	io.update_build_state_io()
+}
+
+func (io *BuildStateWriter) Stop(update_state bool) {
+	if io.writer == nil {
+		return
+	}
+	if update_state {
+		io.update_build_state_io()
+	}
+	io.writer.Stop()
+}
+
+func (io *BuildStateWriter) AddBuild(build_name string) {
+	io.builds[build_name] = false
+	io.update_build_state_io()
+}
+
+func (io *BuildStateWriter) SetBuildFinished(build_name string) {
+	io.builds[build_name] = true
+	io.update_build_state_io()
+}
+
+func (io *BuildStateWriter) active_build_ct() int {
+	ct := 0
+	for _, is_finished := range io.builds {
+		if !is_finished {
+			ct++
+		}
+	}
+	return ct
+}
+
+func (io *BuildStateWriter) total_builds() int {
+	return len(io.builds)
+}
+
+func (io *BuildStateWriter) update_build_state_io() {
+	if io.writer == nil {
+		panic("io writer not started.")
+	}
+	io.io_mu.Lock()
+	defer io.io_mu.Unlock()
+
+	io_sleep_dur := time.Millisecond * 5
+	io_diff := time.Since(io.last_write_time)
+
+	sleep_dur_us := io_sleep_dur.Microseconds() - io_diff.Microseconds()
+	if sleep_dur_us > 0 {
+		var sleep_dur time.Duration = time.Microsecond * time.Duration(sleep_dur_us)
+		time.Sleep(sleep_dur)
+	}
+
+	cyan := color.New(color.FgCyan).SprintFunc()
+	grn := color.New(color.FgHiGreen).SprintFunc()
+
+	active_ct := io.active_build_ct()
+	total_ct := io.total_builds()
+
+	counter_clr := cyan(fmt.Sprintf("[%d/%d]", (total_ct - active_ct), total_ct))
+	msg := fmt.Sprintf("%s Actions completed\n", counter_clr)
+	// Add the active builds to the message
+	for target_name, finished := range io.builds {
+		if !finished {
+			msg += grn(fmt.Sprintf("\tbuilding: %s\n", target_name))
+		}
+	}
+
+	fmt.Fprint(io.writer, msg)
+	io.last_write_time = time.Now()
+}
 
 func filter[T any](t []T, f func(T) bool) []T {
 	var u []T = make([]T, 0)
@@ -238,6 +334,8 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 				func(complete bool) bool { return !complete })) == 0
 		}
 	}
+
+	dctx.build_state_writer.AddBuild(t.Name)
 	return bs, nil
 }
 
@@ -400,7 +498,6 @@ func build_binary(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buf
 		return &errb, err
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Binary built"), color.New(color.FgGreen).SprintFunc()(outbin.Fullpath()))
 	return nil, nil
 }
 
@@ -424,7 +521,6 @@ func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buf
 		return &errb, err
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Object built"), color.New(color.FgGreen).SprintFunc()(outobj.Fullpath()))
 	return nil, nil
 }
 
@@ -448,7 +544,6 @@ func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*byt
 		return &errb, err
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
-	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Static library built"), color.New(color.FgGreen).SprintFunc()(outlib.Fullpath()))
 	return nil, nil
 }
 
@@ -558,6 +653,8 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		dctx.end_build_cache.CachedTargets[bs.target_config.Name] = cache_target
 	}()
 
+	dctx.build_state_writer.SetBuildFinished(bs.target_config.Name)
+
 	// Check if this build can be promoted to the next level of the tree.
 	if bs.promotion_fn(bs) {
 		logger.Debug().Msg("Promoting build to next level.")
@@ -623,8 +720,6 @@ func run_build_tree(root *BuildStep, dctx *DoContext) error {
 			panic("Unexpected build_complete value.")
 		}
 	}
-
-	fmt.Printf("Build Tree Completed!")
 	return nil
 }
 
@@ -653,16 +748,23 @@ func build(dctx *DoContext, args []string) error {
 		return err
 	}
 
+	var build_succeeded bool = false
+	dctx.build_state_writer.Start()
+	// On stop, update the io writer if the build succeeded. That way
+	// the io build state does not interfere with the failed build io.
+	defer dctx.build_state_writer.Stop(build_succeeded)
+
 	btree, err := tinfo.ConstructBuildTree(dctx, tp)
 	if err != nil {
 		return err
 	}
 
 	err = run_build_tree(btree, dctx)
+	// nolint:staticcheck
+	build_succeeded = err != nil
 	if err != nil {
 		return err
 	}
-
 	// Save the new cache.
 	return dctx.RefreshCache()
 }
@@ -741,7 +843,8 @@ type DoContext struct {
 	// The build cache state at the start of the build execution.
 	init_build_cache *BuildCache
 	// The build cache state at the end of the build execution.
-	end_build_cache *BuildCache
+	end_build_cache    *BuildCache
+	build_state_writer *BuildStateWriter
 }
 
 func NewDoContext() *DoContext {
@@ -752,8 +855,9 @@ func NewDoContext() *DoContext {
 		build_tree_state_mu: &sync.Mutex{},
 		build_cancelled:     false,
 
-		init_build_cache: NewBuildCache(),
-		end_build_cache:  NewBuildCache(),
+		init_build_cache:   NewBuildCache(),
+		end_build_cache:    NewBuildCache(),
+		build_state_writer: NewBuildStateWriter(6),
 	}
 }
 
