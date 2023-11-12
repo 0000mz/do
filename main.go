@@ -5,6 +5,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -58,15 +61,36 @@ func is_file(filename string) bool {
 	return !stat.IsDir()
 }
 
+func compute_md5(filename string) ([]byte, error) {
+	filedat, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	md5sum := md5.Sum(filedat)
+
+	return md5sum[:], nil
+}
+
+// Return the first non-nil error amongst a collection of errors.
+// If all errors are nil, return nil.
+func errset(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
 type TargetConfig struct {
-	Name string
-	Srcs []string
-	Hdrs []string
-	Deps []string
+	Name string   `json:"name"`
+	Srcs []string `json:"srcs"`
+	Hdrs []string `json:"hdrs"`
+	Deps []string `json:"deps"`
 	// The target type that should be build.
 	// For library, this can be "static" or "dynamic".
 	// For binary, set to "binary".
-	Type string
+	Type string `json:"-"`
 }
 
 // Validate that all of the information in the target is valid.
@@ -122,6 +146,7 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 		panic("Build step not set during construction of build tree.")
 	}
 
+	bs.target_config = t
 	bs.dependants = deps_buildsteps
 	// Set the parent for for eahc of the deps to the bs
 	for _, dep := range bs.dependants {
@@ -143,6 +168,21 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 		}
 	}
 	return bs, nil
+}
+
+func (t *TargetConfig) ComputeFileHashes() (map[string][]byte, error) {
+
+	var hashes map[string][]byte = make(map[string][]byte)
+	var files []string = append(t.Srcs, t.Hdrs...)
+
+	for _, filename := range files {
+		md5sum, err := compute_md5(filename)
+		if err != nil {
+			return nil, err
+		}
+		hashes[filename] = md5sum
+	}
+	return hashes, nil
 }
 
 func NewBuildStep() *BuildStep {
@@ -245,17 +285,17 @@ type BuildSubStep struct {
 	inputs  []*Artifact
 	outputs []*Artifact
 
-	action_fn func(*BuildStep, *BuildSubStep, *DoContext) (error, *bytes.Buffer)
+	action_fn func(*BuildStep, *BuildSubStep, *DoContext) (*bytes.Buffer, error)
 	next      *BuildSubStep
 }
 
-func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) (error, *bytes.Buffer) {
+func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) (*bytes.Buffer, error) {
 	return bss.action_fn(bs, bss, dctx)
 }
 
-func build_binary(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (error, *bytes.Buffer) {
+func build_binary(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buffer, error) {
 	if len(bss.outputs) != 1 {
-		return fmt.Errorf("incorrect # of outputs for binary build: %d, expects 1", len(bss.outputs)), nil
+		return nil, fmt.Errorf("incorrect # of outputs for binary build: %d, expects 1", len(bss.outputs))
 	}
 
 	// TODO: Appending exe to the produced binary so that windows will know how to handle the file.
@@ -285,16 +325,16 @@ func build_binary(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (error, *by
 
 	out, err := excmd.Output()
 	if err != nil {
-		return err, &errb
+		return &errb, err
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
 	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Binary built"), color.New(color.FgGreen).SprintFunc()(outbin.Fullpath()))
 	return nil, nil
 }
 
-func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (error, *bytes.Buffer) {
+func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buffer, error) {
 	if len(bss.outputs) != 1 {
-		return fmt.Errorf("incorrect # of outputs for object build: %d, expects 1", len(bss.outputs)), nil
+		return nil, fmt.Errorf("incorrect # of outputs for object build: %d, expects 1", len(bss.outputs))
 	}
 
 	outobj := bss.outputs[0]
@@ -309,16 +349,16 @@ func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (error, *by
 
 	out, err := excmd.Output()
 	if err != nil {
-		return err, &errb
+		return &errb, err
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
 	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Object built"), color.New(color.FgGreen).SprintFunc()(outobj.Fullpath()))
 	return nil, nil
 }
 
-func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (error, *bytes.Buffer) {
+func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buffer, error) {
 	if len(bss.outputs) != 1 {
-		return fmt.Errorf("incorrect # of outputs for static lib build: %d, expects 1", len(bss.outputs)), nil
+		return nil, fmt.Errorf("incorrect # of outputs for static lib build: %d, expects 1", len(bss.outputs))
 	}
 
 	var outlib *Artifact = bss.outputs[0]
@@ -333,7 +373,7 @@ func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (erro
 
 	out, err := excmd.Output()
 	if err != nil {
-		return err, &errb
+		return &errb, err
 	}
 	logger.Debug().Msgf("Build command output: %s", string(out))
 	fmt.Printf("%s: %s\n", color.New(color.FgCyan).SprintFunc()("Static library built"), color.New(color.FgGreen).SprintFunc()(outlib.Fullpath()))
@@ -370,6 +410,7 @@ type BuildStep struct {
 	// tree up to the root of the build tree.
 	promotion_fn   func(*BuildStep) bool
 	build_complete bool
+	target_config  *TargetConfig
 }
 
 func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *bytes.Buffer, completech chan bool) {
@@ -383,7 +424,7 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 
 	var bss *BuildSubStep = bs.steps
 	for bss != nil {
-		err, stderr := bss.Build(bs, dctx)
+		stderr, err := bss.Build(bs, dctx)
 		if err != nil {
 			errch <- err
 			stderrch <- stderr
@@ -395,12 +436,26 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		bss = bss.next
 	}
 
+	hashes, err := bs.target_config.ComputeFileHashes()
+	if err != nil {
+		errch <- err
+		stderrch <- nil
+		return
+	}
+
 	{
 		dctx.build_tree_state_mu.Lock()
-		bs.build_complete = true
 		if dctx.build_cancelled {
 			return
 		}
+		bs.build_complete = true
+
+		cache_target := &TargetCache{
+			Target:     bs.target_config,
+			FileHashes: hashes,
+		}
+
+		dctx.end_build_cache.CachedTargets = append(dctx.end_build_cache.CachedTargets, cache_target)
 		dctx.build_tree_state_mu.Unlock()
 	}
 
@@ -508,11 +563,13 @@ func build(dctx *DoContext, args []string) error {
 	if err != nil {
 		return err
 	}
-	return nil
+
+	// Save the new cache.
+	return dctx.RefreshCache()
 }
 
 func clean(dctx *DoContext) error {
-	return os.RemoveAll(dctx.builddir_path)
+	return errset(os.RemoveAll(dctx.builddir_path), os.RemoveAll(dctx.cachedir_path))
 }
 
 // Check if the program's argument list contains the specified argname prefixed
@@ -539,20 +596,69 @@ func get_arg_value(argkey string) (string, error) {
 	return "", fmt.Errorf("no kv arg for key: %s", argkey)
 }
 
+type TargetCache struct {
+	Target *TargetConfig `json:"target"`
+	// For each file defined in the target config store the md5 hash for the file
+	// when it was last built. This should be used to compare against to determine
+	// whether or not a target needs to be rebuilt.
+	FileHashes map[string][]byte `json:"file-hashes"`
+}
+
+// The build cache stores information about the targets that were built and
+// the state of the files that each built target depends on. This is used to determine
+// in future builds whether or not a target should be rebuilt and where to find the
+// cached artifacts.
+type BuildCache struct {
+	CachedTargets []*TargetCache `json:"cached-targets"`
+}
+
+func ensure_dir(dirname string) {
+	err := os.Mkdir(dirname, os.ModeDir)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		panic(err)
+	}
+	logger.Debug().Msgf("Created core build directory: %s", dirname)
+}
+
+func NewBuildCache() *BuildCache {
+	return &BuildCache{
+		CachedTargets: make([]*TargetCache, 0),
+	}
+}
+
 type DoContext struct {
 	builddir_path string
-	c_compiler    string
-	ar            string
+	cachedir_path string
+
+	c_compiler string
+	ar         string
 
 	// Use this mutex to synchronize the access and modification of build
 	// tree state, i.e., build step completion state.
 	build_tree_state_mu *sync.Mutex
 	build_cancelled     bool
+	// The build cache state at the start of the build execution.
+	init_build_cache *BuildCache
+	// The build cache state at the end of the build execution.
+	end_build_cache *BuildCache
+}
+
+func NewDoContext() *DoContext {
+	return &DoContext{
+		c_compiler: "gcc",
+		ar:         "ar",
+
+		build_tree_state_mu: &sync.Mutex{},
+		build_cancelled:     false,
+
+		init_build_cache: nil,
+		end_build_cache:  NewBuildCache(),
+	}
 }
 
 // Setup the do-build directory in the root of the project.
 // The root of the project expects a build.toml file.
-func setup_core_dirs(dctx *DoContext) error {
+func (dctx *DoContext) SetupCoreDirs() error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -564,12 +670,57 @@ func setup_core_dirs(dctx *DoContext) error {
 	}
 
 	dctx.builddir_path = filepath.Join(cwd, ".do-build")
-	err = os.Mkdir(dctx.builddir_path, os.ModeDir)
+	dctx.cachedir_path = filepath.Join(cwd, ".do-cache")
+	ensure_dir(dctx.builddir_path)
+	ensure_dir(dctx.cachedir_path)
+	return nil
+}
+
+func (dctx *DoContext) LoadCache() error {
+	cachefile := filepath.Join(dctx.cachedir_path, "cache.json")
+	if st, err := os.Stat(cachefile); err != nil || st.IsDir() {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// No cache file, skip
+				return nil
+			}
+			return err
+		} else {
+			return fmt.Errorf("invalid file type for file: %s", cachefile)
+		}
+	}
+
+	cachedat, err := os.ReadFile(cachefile)
 	if err != nil {
 		return err
 	}
-	logger.Debug().Msgf("Created core build directory: %s", dctx.builddir_path)
+
+	var bcache BuildCache
+	err = json.Unmarshal(cachedat, &bcache)
+	if err != nil {
+		return err
+	}
+	dctx.init_build_cache = &bcache
 	return nil
+}
+
+func (dctx *DoContext) RefreshCache() error {
+	new_cache_data, err := json.Marshal(dctx.end_build_cache)
+	if err != nil {
+		return err
+	}
+
+	cachefile := filepath.Join(dctx.cachedir_path, "cache.json")
+	f, err := os.OpenFile(cachefile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(new_cache_data)
+	if err != nil {
+		return err
+	}
+	return err
 }
 
 func init() {
@@ -630,16 +781,18 @@ func main() {
 	action := os.Args[1]
 	fmt.Printf("%s %s\n", color.New(color.FgCyan).SprintFunc()("do"), color.New(color.FgGreen).SprintFunc()(action))
 
-	dctx = &DoContext{
-		c_compiler: "gcc",
-		ar:         "ar",
-
-		build_tree_state_mu: &sync.Mutex{},
-		build_cancelled:     false,
-	}
-	setup_core_dirs(dctx)
+	dctx = NewDoContext()
 
 	var err error
+	err = dctx.SetupCoreDirs()
+	if err != nil {
+		panic(err)
+	}
+	err = dctx.LoadCache()
+	if err != nil {
+		panic(err)
+	}
+
 	switch action {
 	case "build":
 		err = build(dctx, os.Args[2:])
