@@ -48,8 +48,8 @@ func apply[U any, V any](iterable []U, fx func(U) V) []V {
 
 func convert_path_to_artifact(path string) *Artifact {
 	return &Artifact{
-		dir:   filepath.Dir(path),
-		fname: filepath.Base(path),
+		Dir:   filepath.Dir(path),
+		Fname: filepath.Base(path),
 	}
 }
 
@@ -80,6 +80,68 @@ func errset(errs ...error) error {
 		}
 	}
 	return nil
+}
+
+func bytearr_equal(a []byte, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Determine if the `target`'s artifacts need to be refreshed.
+// The artifacts need to be refreshed if the files it depends on have a different
+// hash compared to the file hashes in the `cache`.
+func compute_refresh(target *TargetConfig, cache *BuildCache) bool {
+	tcache, is_cached := cache.CachedTargets[target.Name]
+	if !is_cached {
+		return true
+	}
+
+	var files []string = append(target.Hdrs, target.Srcs...)
+	for _, filename := range files {
+		filehash, is_hashed := tcache.FileHashes[filename]
+		if !is_hashed {
+			return true
+		}
+		curr_md5, err := compute_md5(filename)
+		if err != nil {
+			// Couldnt compute md5 hash, so refresh the build.
+			return true
+		}
+		if !bytearr_equal(filehash, curr_md5) {
+			return true
+		}
+	}
+
+	// Check if the list of dependencies changed.
+	if len(target.Deps) != len(tcache.Target.Deps) {
+		return true
+	}
+	var cache_deps map[string]bool = make(map[string]bool)
+	for _, cdep := range tcache.Target.Deps {
+		cache_deps[cdep] = true
+	}
+	for _, depname := range target.Deps {
+		_, hasdep := cache_deps[depname]
+		if !hasdep {
+			return true
+		}
+	}
+
+	// Check if the artifacts exist.
+	for _, artifact := range tcache.Artifacts {
+		if !artifact.Exists() {
+			return true
+		}
+	}
+
+	return false
 }
 
 type TargetConfig struct {
@@ -146,10 +208,19 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 		panic("Build step not set during construction of build tree.")
 	}
 
+	// Check if any of the files this target depends on have changed.
+	bs.needs_refresh = compute_refresh(t, dctx.init_build_cache)
+
 	bs.target_config = t
 	bs.dependants = deps_buildsteps
 	// Set the parent for for eahc of the deps to the bs
 	for _, dep := range bs.dependants {
+		// If the dependant needs to be refreshed, then so does the parent,
+		// regardless of what its previous value was.
+		if dep.needs_refresh {
+			bs.needs_refresh = true
+		}
+
 		dep.parent = bs
 		dep.promotion_fn = func(curr_bs *BuildStep) bool {
 			dctx.build_tree_state_mu.Lock()
@@ -189,13 +260,14 @@ func NewBuildStep() *BuildStep {
 	return &BuildStep{
 		promotion_fn:   func(_ *BuildStep) bool { return false },
 		build_complete: false,
+		needs_refresh:  false,
 	}
 }
 
 func (t *TargetConfig) binary_build_step(dctx *DoContext) (*BuildStep, error) {
 	binfils_bs := &BuildSubStep{
 		inputs:    apply(t.Srcs, convert_path_to_artifact),
-		outputs:   []*Artifact{{dir: dctx.builddir_path, fname: t.Name}},
+		outputs:   []*Artifact{{Dir: dctx.builddir_path, Fname: t.Name}},
 		action_fn: build_binary,
 	}
 
@@ -212,13 +284,13 @@ func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
 
 	objfile_bs := &BuildSubStep{
 		inputs:    apply(t.Srcs, convert_path_to_artifact),
-		outputs:   []*Artifact{{dir: dctx.builddir_path, fname: fmt.Sprintf("%s.o", t.Name)}},
+		outputs:   []*Artifact{{Dir: dctx.builddir_path, Fname: fmt.Sprintf("%s.o", t.Name)}},
 		action_fn: build_object,
 	}
 
 	libfile_bs := &BuildSubStep{
 		inputs:    objfile_bs.outputs,
-		outputs:   []*Artifact{{dir: dctx.builddir_path, fname: fmt.Sprintf("%s.a", t.Name)}},
+		outputs:   []*Artifact{{Dir: dctx.builddir_path, Fname: fmt.Sprintf("%s.a", t.Name)}},
 		action_fn: produce_static_lib,
 	}
 	objfile_bs.next = libfile_bs
@@ -314,7 +386,7 @@ func build_binary(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buf
 	}
 
 	for _, static_lib := range static_libs {
-		cmd = append(cmd, fmt.Sprintf("-L%s", static_lib.dir), fmt.Sprintf("-l:%s", static_lib.fname))
+		cmd = append(cmd, fmt.Sprintf("-L%s", static_lib.Dir), fmt.Sprintf("-l:%s", static_lib.Fname))
 	}
 
 	logger.Debug().Msgf("Binary Build command: %#v", cmd)
@@ -383,13 +455,18 @@ func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*byt
 // An artifact is a product of a build step.
 type Artifact struct {
 	// The directory that the artifact is stored in.
-	dir string
+	Dir string `json:"dir"`
 	// The filename of the artifact within the directory.
-	fname string
+	Fname string `json:"fname"`
+}
+
+func (a *Artifact) Exists() bool {
+	_, err := os.Stat(a.Fullpath())
+	return err == nil
 }
 
 func (a *Artifact) Fullpath() string {
-	return filepath.Join(a.dir, a.fname)
+	return filepath.Join(a.Dir, a.Fname)
 }
 
 // Build step define how to build a specific transition unit
@@ -411,31 +488,51 @@ type BuildStep struct {
 	promotion_fn   func(*BuildStep) bool
 	build_complete bool
 	target_config  *TargetConfig
+	// Determine if a build step needs to be rebuilt if any of the files it depends
+	// on has changed or any of the files its dependencies depend on have changed.
+	needs_refresh bool
 }
 
 func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *bytes.Buffer, completech chan bool) {
-	{
+	func() {
 		dctx.build_tree_state_mu.Lock()
+		defer dctx.build_tree_state_mu.Unlock()
 		if dctx.build_cancelled {
 			return
 		}
-		dctx.build_tree_state_mu.Unlock()
+	}()
+
+	// Check if this build step needs to be refreshed. If not, mark the build as
+	// complete.
+	if bs.needs_refresh {
+		var bss *BuildSubStep = bs.steps
+		for bss != nil {
+			stderr, err := bss.Build(bs, dctx)
+			if err != nil {
+				errch <- err
+				stderrch <- stderr
+				return
+			}
+			if bss.next == nil {
+				bs.output_artifacts = bss.outputs
+			}
+			bss = bss.next
+		}
+	} else {
+		// Get the output artifacts from the build cache.
+		func() {
+			dctx.build_tree_state_mu.Lock()
+			defer dctx.build_tree_state_mu.Unlock()
+
+			cached, is_cached := dctx.init_build_cache.CachedTargets[bs.target_config.Name]
+			if !is_cached {
+				panic("BuildStep marked as cached but no cache entry found.")
+			}
+			bs.output_artifacts = cached.Artifacts
+		}()
 	}
 
-	var bss *BuildSubStep = bs.steps
-	for bss != nil {
-		stderr, err := bss.Build(bs, dctx)
-		if err != nil {
-			errch <- err
-			stderrch <- stderr
-			return
-		}
-		if bss.next == nil {
-			bs.output_artifacts = bss.outputs
-		}
-		bss = bss.next
-	}
-
+	// Build complete. Update the cache.
 	hashes, err := bs.target_config.ComputeFileHashes()
 	if err != nil {
 		errch <- err
@@ -443,8 +540,10 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		return
 	}
 
-	{
+	func() {
 		dctx.build_tree_state_mu.Lock()
+		defer dctx.build_tree_state_mu.Unlock()
+
 		if dctx.build_cancelled {
 			return
 		}
@@ -453,11 +552,11 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		cache_target := &TargetCache{
 			Target:     bs.target_config,
 			FileHashes: hashes,
+			Artifacts:  bs.output_artifacts,
 		}
 
-		dctx.end_build_cache.CachedTargets = append(dctx.end_build_cache.CachedTargets, cache_target)
-		dctx.build_tree_state_mu.Unlock()
-	}
+		dctx.end_build_cache.CachedTargets[bs.target_config.Name] = cache_target
+	}()
 
 	// Check if this build can be promoted to the next level of the tree.
 	if bs.promotion_fn(bs) {
@@ -602,6 +701,8 @@ type TargetCache struct {
 	// when it was last built. This should be used to compare against to determine
 	// whether or not a target needs to be rebuilt.
 	FileHashes map[string][]byte `json:"file-hashes"`
+	// Cthe location of artifacts produced by the target.
+	Artifacts []*Artifact `json:"artifacts"`
 }
 
 // The build cache stores information about the targets that were built and
@@ -609,7 +710,7 @@ type TargetCache struct {
 // in future builds whether or not a target should be rebuilt and where to find the
 // cached artifacts.
 type BuildCache struct {
-	CachedTargets []*TargetCache `json:"cached-targets"`
+	CachedTargets map[string]*TargetCache `json:"cached-targets"`
 }
 
 func ensure_dir(dirname string) {
@@ -622,7 +723,7 @@ func ensure_dir(dirname string) {
 
 func NewBuildCache() *BuildCache {
 	return &BuildCache{
-		CachedTargets: make([]*TargetCache, 0),
+		CachedTargets: make(map[string]*TargetCache, 0),
 	}
 }
 
@@ -651,7 +752,7 @@ func NewDoContext() *DoContext {
 		build_tree_state_mu: &sync.Mutex{},
 		build_cancelled:     false,
 
-		init_build_cache: nil,
+		init_build_cache: NewBuildCache(),
 		end_build_cache:  NewBuildCache(),
 	}
 }
@@ -705,7 +806,7 @@ func (dctx *DoContext) LoadCache() error {
 }
 
 func (dctx *DoContext) RefreshCache() error {
-	new_cache_data, err := json.Marshal(dctx.end_build_cache)
+	new_cache_data, err := json.MarshalIndent(dctx.end_build_cache, "", "  ")
 	if err != nil {
 		return err
 	}
