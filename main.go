@@ -468,25 +468,7 @@ func build_binary(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buf
 		return nil, fmt.Errorf("incorrect # of outputs for binary build: %d, expects 1", len(bss.outputs))
 	}
 
-	// TODO: Appending exe to the produced binary so that windows will know how to handle the file.
-	// This is not portable and is only windows specific. Abstract this away so that the filename
-	// decision is more intuitive based on the operating system and the type of object being built.
-	outbin := bss.outputs[0]
-	exepath := fmt.Sprintf("%s.exe", outbin.Fullpath())
-	cmd := []string{dctx.c_compiler, "-o", exepath}
-	cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
-
-	// Collect the artifacts from the dependants and append it to the command.
-	// This assumes that every dependant build step produces a static library.
-	var static_libs []*Artifact = make([]*Artifact, 0)
-	for _, dep_bs := range bs.dependants {
-		static_libs = append(static_libs, dep_bs.output_artifacts...)
-	}
-
-	for _, static_lib := range static_libs {
-		cmd = append(cmd, fmt.Sprintf("-L%s", static_lib.Dir), fmt.Sprintf("-l:%s", static_lib.Fname))
-	}
-
+	cmd := dctx.c_toolchain.build_binary_cmd_fn(dctx, bs, bss)
 	logger.Debug().Msgf("Binary Build command: %#v", cmd)
 
 	var errb bytes.Buffer
@@ -506,10 +488,7 @@ func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buf
 		return nil, fmt.Errorf("incorrect # of outputs for object build: %d, expects 1", len(bss.outputs))
 	}
 
-	outobj := bss.outputs[0]
-	cmd := []string{dctx.c_compiler, "-c", "-o", outobj.Fullpath()}
-	cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
-
+	cmd := dctx.c_toolchain.compile_object_cmd_fn(dctx, bs, bss)
 	logger.Debug().Msgf("Object Build command: %#v", cmd)
 
 	var errb bytes.Buffer
@@ -529,9 +508,7 @@ func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*byt
 		return nil, fmt.Errorf("incorrect # of outputs for static lib build: %d, expects 1", len(bss.outputs))
 	}
 
-	var outlib *Artifact = bss.outputs[0]
-	cmd := []string{dctx.ar, "rcs", outlib.Fullpath()}
-	cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+	cmd := dctx.c_toolchain.build_static_lib_cmd_fn(dctx, bs, bss)
 
 	logger.Debug().Msgf("Static Lib Build Command: %#v", cmd)
 
@@ -797,6 +774,56 @@ func get_arg_value(argkey string) (string, error) {
 	return "", fmt.Errorf("no kv arg for key: %s", argkey)
 }
 
+type Toolchain struct {
+	build_binary_cmd_fn     func(*DoContext, *BuildStep, *BuildSubStep) []string
+	compile_object_cmd_fn   func(*DoContext, *BuildStep, *BuildSubStep) []string
+	build_static_lib_cmd_fn func(*DoContext, *BuildStep, *BuildSubStep) []string
+}
+
+func NewGccToolchain() *Toolchain {
+
+	apply_static_libs := func(bs *BuildStep, cmd []string) []string {
+		// Collect the artifacts from the dependants and append it to the command.
+		// This assumes that every dependant build step produces a static library.
+		var static_libs []*Artifact = make([]*Artifact, 0)
+		for _, dep_bs := range bs.dependants {
+			static_libs = append(static_libs, dep_bs.output_artifacts...)
+		}
+
+		for _, static_lib := range static_libs {
+			cmd = append(cmd, fmt.Sprintf("-L%s", static_lib.Dir), fmt.Sprintf("-l:%s", static_lib.Fname))
+		}
+		return cmd
+	}
+
+	return &Toolchain{
+		build_binary_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
+			outbin := bss.outputs[0]
+			// TODO: Appending exe to the produced binary so that windows will know how to handle the file.
+			// This is not portable and is only windows specific. Abstract this away so that the filename
+			// decision is more intuitive based on the operating system and the type of object being built.
+			exepath := fmt.Sprintf("%s.exe", outbin.Fullpath())
+			cmd := []string{"gcc", "-o", exepath}
+			cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+			cmd = apply_static_libs(bs, cmd)
+			return cmd
+		},
+		compile_object_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
+			outobj := bss.outputs[0]
+			cmd := []string{"gcc", "-c", "-o", outobj.Fullpath()}
+			cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+			cmd = apply_static_libs(bs, cmd)
+			return cmd
+		},
+		build_static_lib_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
+			var outlib *Artifact = bss.outputs[0]
+			cmd := []string{"ar", "rcs", outlib.Fullpath()}
+			cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+			return cmd
+		},
+	}
+}
+
 type TargetCache struct {
 	Target *TargetConfig `json:"target"`
 	// For each file defined in the target config store the md5 hash for the file
@@ -833,8 +860,7 @@ type DoContext struct {
 	builddir_path string
 	cachedir_path string
 
-	c_compiler string
-	ar         string
+	c_toolchain *Toolchain
 
 	// Use this mutex to synchronize the access and modification of build
 	// tree state, i.e., build step completion state.
@@ -849,8 +875,7 @@ type DoContext struct {
 
 func NewDoContext() *DoContext {
 	return &DoContext{
-		c_compiler: "gcc",
-		ar:         "ar",
+		c_toolchain: NewGccToolchain(),
 
 		build_tree_state_mu: &sync.Mutex{},
 		build_cancelled:     false,
