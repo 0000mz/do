@@ -5,8 +5,14 @@ Type = "static"
 
 [Targets.my_binary]
 Srcs = ["example_srcs/main.c"]
+Deps = ["my_library"]
+Type = "binary"
+
+[Targets.my_binary_with_zlib]
+Srcs = ["example_srcs/main.c"]
 Deps = ["my_library", "zlib"]
 Type = "binary"
+
 
 [Targets.zlib]
 Git = "https://github.com/madler/zlib.git"

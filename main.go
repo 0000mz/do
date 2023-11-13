@@ -29,6 +29,97 @@ var (
 	dctx    *DoContext
 )
 
+type CommandBuilder struct {
+	libdirs     map[string]bool
+	includedirs map[string]bool
+	srcfiles    map[string]bool
+	libs        map[string]bool
+	compiler    string
+	outfile     string
+}
+
+func NewCommandBuilder() *CommandBuilder {
+	return &CommandBuilder{
+		libdirs:     make(map[string]bool),
+		includedirs: make(map[string]bool),
+		srcfiles:    make(map[string]bool),
+		libs:        make(map[string]bool),
+	}
+}
+
+func (cmd *CommandBuilder) AddLibDir(libdirs ...string) *CommandBuilder {
+	for _, libdir := range libdirs {
+		cmd.libdirs[libdir] = true
+	}
+	return cmd
+}
+
+func (cmd *CommandBuilder) AddIncludeDirs(includedirs ...string) *CommandBuilder {
+	for _, includedir := range includedirs {
+		cmd.includedirs[includedir] = true
+	}
+	return cmd
+}
+
+func (cmd *CommandBuilder) AddSrcFiles(srcfiles ...string) *CommandBuilder {
+	for _, srcfile := range srcfiles {
+		cmd.srcfiles[srcfile] = true
+	}
+	return cmd
+}
+
+func (cmd *CommandBuilder) AddLibs(libnames ...string) *CommandBuilder {
+	for _, libname := range libnames {
+		cmd.libs[libname] = true
+	}
+	return cmd
+}
+
+func (cmd *CommandBuilder) AddCompiler(compiler string) *CommandBuilder {
+	cmd.compiler = compiler
+	return cmd
+}
+
+func (cmd *CommandBuilder) AddOutput(output string) *CommandBuilder {
+	cmd.outfile = output
+	return cmd
+}
+
+type BuildMode int
+
+const (
+	// Set the compiler to produce an executable binary.
+	BuildModeExe BuildMode = 1
+	// Set the compiler to produce object files.
+	BuildModeCompile BuildMode = 2
+)
+
+func (cmd *CommandBuilder) Build(mode BuildMode) []string {
+	cmdlst := []string{cmd.compiler}
+
+	switch mode {
+	case BuildModeExe:
+		cmdlst = append(cmdlst, "-o")
+	case BuildModeCompile:
+		cmdlst = append(cmdlst, "-c", "-o")
+	}
+
+	cmdlst = append(cmdlst, cmd.outfile)
+	for inputfile := range cmd.srcfiles {
+		cmdlst = append(cmdlst, inputfile)
+	}
+	for includedir := range cmd.includedirs {
+		cmdlst = append(cmdlst, "-I", includedir)
+	}
+	for libdir := range cmd.libdirs {
+		cmdlst = append(cmdlst, "-L", libdir)
+	}
+	for lib := range cmd.libs {
+		cmdlst = append(cmdlst, fmt.Sprintf("-l:%s", lib))
+	}
+	return cmdlst
+}
+
 type BuildStateWriter struct {
 	// The number of state io to maange at a time.
 	state_io_ct int
@@ -833,7 +924,7 @@ type Toolchain struct {
 
 func NewGccToolchain() *Toolchain {
 
-	apply_static_libs := func(bs *BuildStep, cmd []string) []string {
+	apply_static_libs := func(bs *BuildStep, cmdb *CommandBuilder) *CommandBuilder {
 		// Collect the artifacts from the dependants and append it to the command.
 		// This assumes that every dependant build step produces a static library.
 		var static_libs []*Artifact = make([]*Artifact, 0)
@@ -842,9 +933,9 @@ func NewGccToolchain() *Toolchain {
 		}
 
 		for _, static_lib := range static_libs {
-			cmd = append(cmd, fmt.Sprintf("-L%s", static_lib.Dir), fmt.Sprintf("-l:%s", static_lib.Fname))
+			cmdb = cmdb.AddLibDir(static_lib.Dir).AddLibs(static_lib.Fname)
 		}
-		return cmd
+		return cmdb
 	}
 
 	return &Toolchain{
@@ -854,17 +945,25 @@ func NewGccToolchain() *Toolchain {
 			// This is not portable and is only windows specific. Abstract this away so that the filename
 			// decision is more intuitive based on the operating system and the type of object being built.
 			exepath := fmt.Sprintf("%s.exe", outbin.Fullpath())
-			cmd := []string{"gcc", "-o", exepath}
-			cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
-			cmd = apply_static_libs(bs, cmd)
-			return cmd
+
+			cmdb := NewCommandBuilder().
+				AddCompiler("gcc").
+				AddOutput(exepath).
+				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+
+			cmdb = apply_static_libs(bs, cmdb)
+			return cmdb.Build(BuildModeExe)
 		},
 		compile_object_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
+
 			outobj := bss.outputs[0]
-			cmd := []string{"gcc", "-c", "-o", outobj.Fullpath()}
-			cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
-			cmd = apply_static_libs(bs, cmd)
-			return cmd
+			cmdb := NewCommandBuilder().
+				AddCompiler("gcc").
+				AddOutput(outobj.Fullpath()).
+				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+
+			cmdb = apply_static_libs(bs, cmdb)
+			return cmdb.Build(BuildModeCompile)
 		},
 		build_static_lib_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
 			var outlib *Artifact = bss.outputs[0]
