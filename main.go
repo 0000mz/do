@@ -1173,21 +1173,51 @@ func run_clean_subcommand(dctx *DoContext, flgset *SubCommand, args []string) er
 	return clean(dctx)
 }
 
+func run_init_subcommand(dctx *DoContext, flagset *SubCommand, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("no project name specified")
+	}
+
+	var project_name string = args[0]
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	var project_path string = filepath.Join(cwd, project_name)
+	if _, err = os.Stat(project_path); err == nil {
+		return fmt.Errorf("file already exists: %s", project_path)
+	}
+
+	err = os.Mkdir(project_name, os.ModeDir)
+	if err != nil {
+		return err
+	}
+
+	_, err = os.OpenFile(filepath.Join(project_path, "build.toml"), os.O_RDONLY|os.O_CREATE, 0666)
+	if err == nil {
+		fmt.Printf("\tProject %s created successfully.\n", color.New(color.FgHiGreen).SprintFunc()(project_name))
+		fmt.Printf("\tCheck out the directory: %s", color.New(color.FgHiGreen).SprintfFunc()("cd ./%s", project_name))
+	}
+	return err
+}
+
 func main() {
 	var err error
 
 	// TODO(0000mz): Populate the flag set for each subcommand.
 	var subcommands []*SubCommand = []*SubCommand{
+		{name: "init", usage: "Initialize a new c project.", flagset: nil, run_subcommand: run_init_subcommand},
 		{name: "build", usage: "Build a target.", flagset: nil, run_subcommand: run_builld_subcommand},
 		{name: "clean", usage: "Clean up targets and cache.", flagset: nil, run_subcommand: run_clean_subcommand},
 	}
 
-	fmt.Printf("%s - %s\n", color.New(color.FgCyan).SprintFunc()("do"), color.New(color.FgGreen).SprintFunc()("c action runner"))
-	if len(os.Args) <= 1 {
+	fmt.Printf("%s - %s\n", color.New(color.FgHiCyan).SprintFunc()("do"), color.New(color.FgHiGreen).SprintFunc()("c action runner"))
+	if len(os.Args) <= 1 || os.Args[1] == "--help" {
 		for _, subcmd := range subcommands {
-			fmt.Printf("\t%s\t%s\n", subcmd.name, subcmd.usage)
+			fmt.Printf("\t%s\t%s\n", color.New(color.FgHiCyan).SprintFunc()(subcmd.name), subcmd.usage)
 		}
-		os.Exit(1)
+		return
 	}
 
 	var subcommand string = os.Args[1]
