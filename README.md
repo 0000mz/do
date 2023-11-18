@@ -4,7 +4,7 @@ This project can be used for building your c targets and run tests.
 `do` uses TOML config file for configuring targets.
 
 ## Configuring Build Target
-```
+```toml
 [Targets.my_lib]
 Type = "static"
 Srcs = ["my_lib.c"]
