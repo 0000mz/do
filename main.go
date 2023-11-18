@@ -8,10 +8,10 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -120,67 +120,80 @@ func (cmd *CommandBuilder) Build(mode BuildMode) []string {
 	return cmdlst
 }
 
-type BuildStateWriter struct {
+type ActionState struct {
+	action_type string
+	action_name string
+	active      bool
+}
+
+type ActionStateWriter struct {
 	// The number of state io to maange at a time.
 	state_io_ct int
 	writer      *uilive.Writer
 
 	// Keep tracks of the builds in progress.
-	builds map[string]bool
-	io_mu  *sync.Mutex
+	actions map[string]*ActionState
+	io_mu   *sync.Mutex
 
 	last_write_time time.Time
 }
 
-func NewBuildStateWriter(state_ct int) *BuildStateWriter {
-	return &BuildStateWriter{
+func NewActionStateWriter(state_ct int) *ActionStateWriter {
+	return &ActionStateWriter{
 		state_io_ct: state_ct,
-		builds:      make(map[string]bool),
+		actions:     make(map[string]*ActionState),
 		io_mu:       &sync.Mutex{},
 	}
 }
 
-func (io *BuildStateWriter) Start() {
+func (io *ActionStateWriter) Start() {
 	io.writer = uilive.New()
 	io.writer.Start()
-	io.update_build_state_io()
+	io.update_action_state_io()
 }
 
-func (io *BuildStateWriter) Stop(update_state bool) {
+func (io *ActionStateWriter) Stop(update_state bool) {
 	if io.writer == nil {
 		return
 	}
 	if update_state {
-		io.update_build_state_io()
+		io.update_action_state_io()
 	}
 	io.writer.Stop()
 }
 
-func (io *BuildStateWriter) AddBuild(build_name string) {
-	io.builds[build_name] = false
-	io.update_build_state_io()
+func (io *ActionStateWriter) AddAction(action_id, action_type, action_name string) {
+	io.actions[action_id] = &ActionState{
+		action_type: action_type,
+		action_name: action_name,
+		active:      true,
+	}
+	io.update_action_state_io()
 }
 
-func (io *BuildStateWriter) SetBuildFinished(build_name string) {
-	io.builds[build_name] = true
-	io.update_build_state_io()
+func (io *ActionStateWriter) SetActionFinished(action_id string) {
+	action_state, has_action := io.actions[action_id]
+	if has_action {
+		action_state.active = false
+		io.update_action_state_io()
+	}
 }
 
-func (io *BuildStateWriter) active_build_ct() int {
+func (io *ActionStateWriter) active_build_ct() int {
 	ct := 0
-	for _, is_finished := range io.builds {
-		if !is_finished {
+	for _, act := range io.actions {
+		if act.active {
 			ct++
 		}
 	}
 	return ct
 }
 
-func (io *BuildStateWriter) total_builds() int {
-	return len(io.builds)
+func (io *ActionStateWriter) total_builds() int {
+	return len(io.actions)
 }
 
-func (io *BuildStateWriter) update_build_state_io() {
+func (io *ActionStateWriter) update_action_state_io() {
 	if io.writer == nil {
 		panic("io writer not started.")
 	}
@@ -205,9 +218,9 @@ func (io *BuildStateWriter) update_build_state_io() {
 	counter_clr := cyan(fmt.Sprintf("[%d/%d]", (total_ct - active_ct), total_ct))
 	msg := fmt.Sprintf("%s Actions completed\n", counter_clr)
 	// Add the active builds to the message
-	for target_name, finished := range io.builds {
-		if !finished {
-			msg += grn(fmt.Sprintf("\tbuilding: %s\n", target_name))
+	for _, act := range io.actions {
+		if act.active {
+			msg += grn(fmt.Sprintf("\t%s: %s\n", act.action_type, act.action_name))
 		}
 	}
 
@@ -290,11 +303,11 @@ func create_git_pull_buildstep(t *TargetConfig) (*BuildSubStep, error) {
 	projname := filepath.Base(t.Git)
 	export_dir := filepath.Join(dctx.builddir_path, "external", fmt.Sprintf("%s-%s", projname, t.Hash))
 	bss := &BuildSubStep{
-		inputs:  []*Artifact{{Url: t.Git, Fname: t.Hash}},
-		outputs: []*Artifact{{Dir: export_dir}},
-		action_fn: func(bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
-			return nil, fmt.Errorf("git pull buildstep not implemented")
-		},
+		inputs:      []*Artifact{{Url: t.Git, Fname: t.Hash}},
+		outputs:     []*Artifact{{Dir: export_dir}},
+		action_fn:   pull_git_action,
+		name:        t.Git,
+		action_type: "downloading",
 	}
 	return bss, nil
 }
@@ -372,6 +385,8 @@ type TargetConfig struct {
 	// For binary, set to "binary".
 	// For external, set to "external".
 	Type string `json:"-"`
+
+	id string
 }
 
 // Validate that all of the information in the target is valid.
@@ -460,7 +475,7 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 		}
 	}
 
-	dctx.build_state_writer.AddBuild(t.Name)
+	dctx.action_state_writer.AddAction(t.id, "build", t.Name)
 	return bs, nil
 }
 
@@ -489,9 +504,11 @@ func NewBuildStep() *BuildStep {
 
 func (t *TargetConfig) binary_build_step(dctx *DoContext) (*BuildStep, error) {
 	binfils_bs := &BuildSubStep{
-		inputs:    apply(t.Srcs, convert_path_to_artifact),
-		outputs:   []*Artifact{{Dir: dctx.builddir_path, Fname: t.Name}},
-		action_fn: build_binary,
+		inputs:      apply(t.Srcs, convert_path_to_artifact),
+		outputs:     []*Artifact{{Dir: dctx.builddir_path, Fname: t.Name}},
+		action_fn:   build_binary_action,
+		name:        t.Name,
+		action_type: "compiling",
 	}
 
 	bs := NewBuildStep()
@@ -505,16 +522,22 @@ func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
 	// Step 1: build the object files with the compiler.
 	// Step 2: Use ar to product the library from the produced object fles.
 
+	var objfile string = fmt.Sprintf("%s.o", t.Name)
 	objfile_bss := &BuildSubStep{
-		inputs:    apply(t.Srcs, convert_path_to_artifact),
-		outputs:   []*Artifact{{Dir: dctx.builddir_path, Fname: fmt.Sprintf("%s.o", t.Name)}},
-		action_fn: build_object,
+		inputs:      apply(t.Srcs, convert_path_to_artifact),
+		outputs:     []*Artifact{{Dir: dctx.builddir_path, Fname: objfile}},
+		action_fn:   build_object_action,
+		name:        objfile,
+		action_type: "compiling",
 	}
 
+	var libname string = fmt.Sprintf("%s.a", t.Name)
 	libfile_bss := &BuildSubStep{
-		inputs:    objfile_bss.outputs,
-		outputs:   []*Artifact{{Dir: dctx.builddir_path, Fname: fmt.Sprintf("%s.a", t.Name)}},
-		action_fn: produce_static_lib,
+		inputs:      objfile_bss.outputs,
+		outputs:     []*Artifact{{Dir: dctx.builddir_path, Fname: libname}},
+		action_fn:   produce_static_lib_action,
+		name:        libname,
+		action_type: "linking",
 	}
 	objfile_bss.next = libfile_bss
 
@@ -533,6 +556,30 @@ func (t *TargetConfig) external_build_step(dctx *DoContext) (*BuildStep, error) 
 	if err != nil {
 		return nil, err
 	}
+
+	if len(t.Config) == 0 {
+		return nil, fmt.Errorf("no config provided for external build")
+	}
+
+	external_build_action_fn, has_build_config := external_build_steps[t.Config]
+	if !has_build_config {
+		return nil, fmt.Errorf("build config not found for \"%s\": external build configs provided are %#v", t.Config, get_all_all_external_build_configs())
+	}
+
+	if len(git_pull_bss.outputs) != 1 {
+		panic("git pull build step should only have 1 output")
+	}
+
+	var project_pulldir string = git_pull_bss.outputs[0].Dir
+	external_build_bss := &BuildSubStep{
+		inputs: []*Artifact{{Dir: project_pulldir, Fname: t.Config}},
+		action_fn: func(bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
+			return external_build_action_fn(project_pulldir, bs, bss, dc)
+		},
+		action_type: "building",
+		name:        fmt.Sprintf("running %s on %s", t.Config, t.Name),
+	}
+	git_pull_bss.next = external_build_bss
 
 	bs := NewBuildStep()
 	bs.steps = git_pull_bss
@@ -583,6 +630,9 @@ func NewTargetParser(config_file string) (*TargetParser, error) {
 func (t *TargetParser) FindTarget(target_name string) (*TargetConfig, error) {
 	for tname, tcfg := range t.targets {
 		if tname == target_name {
+			if len(tcfg.id) == 0 {
+				tcfg.id = make_unique_id()
+			}
 			return &tcfg, nil
 		}
 	}
@@ -595,73 +645,27 @@ type BuildSubStep struct {
 	inputs  []*Artifact
 	outputs []*Artifact
 
+	// Name and action type to describe the build sub step.
+	// This is used for logging the actions taking place.
+	name        string
+	action_type string
+
 	action_fn func(*BuildStep, *BuildSubStep, *DoContext) (*bytes.Buffer, error)
 	next      *BuildSubStep
 }
 
 func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) (*bytes.Buffer, error) {
-	return bss.action_fn(bs, bss, dctx)
-}
+	var err error = nil
+	var action_id string = make_unique_id()
+	dctx.action_state_writer.AddAction(action_id, bss.action_type, bss.name)
+	defer func() {
+		if err == nil {
+			dctx.action_state_writer.SetActionFinished(action_id)
+		}
+	}()
 
-func build_binary(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buffer, error) {
-	if len(bss.outputs) != 1 {
-		return nil, fmt.Errorf("incorrect # of outputs for binary build: %d, expects 1", len(bss.outputs))
-	}
-
-	cmd := dctx.c_toolchain.build_binary_cmd_fn(dctx, bs, bss)
-	logger.Debug().Msgf("Binary Build command: %#v", cmd)
-
-	var errb bytes.Buffer
-	excmd := exec.Command(cmd[0], cmd[1:]...)
-	excmd.Stderr = &errb
-
-	out, err := excmd.Output()
-	if err != nil {
-		return &errb, err
-	}
-	logger.Debug().Msgf("Build command output: %s", string(out))
-	return nil, nil
-}
-
-func build_object(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buffer, error) {
-	if len(bss.outputs) != 1 {
-		return nil, fmt.Errorf("incorrect # of outputs for object build: %d, expects 1", len(bss.outputs))
-	}
-
-	cmd := dctx.c_toolchain.compile_object_cmd_fn(dctx, bs, bss)
-	logger.Debug().Msgf("Object Build command: %#v", cmd)
-
-	var errb bytes.Buffer
-	excmd := exec.Command(cmd[0], cmd[1:]...)
-	excmd.Stderr = &errb
-
-	out, err := excmd.Output()
-	if err != nil {
-		return &errb, err
-	}
-	logger.Debug().Msgf("Build command output: %s", string(out))
-	return nil, nil
-}
-
-func produce_static_lib(bs *BuildStep, bss *BuildSubStep, dctx *DoContext) (*bytes.Buffer, error) {
-	if len(bss.outputs) != 1 {
-		return nil, fmt.Errorf("incorrect # of outputs for static lib build: %d, expects 1", len(bss.outputs))
-	}
-
-	cmd := dctx.c_toolchain.build_static_lib_cmd_fn(dctx, bs, bss)
-
-	logger.Debug().Msgf("Static Lib Build Command: %#v", cmd)
-
-	var errb bytes.Buffer
-	excmd := exec.Command(cmd[0], cmd[1:]...)
-	excmd.Stderr = &errb
-
-	out, err := excmd.Output()
-	if err != nil {
-		return &errb, err
-	}
-	logger.Debug().Msgf("Build command output: %s", string(out))
-	return nil, nil
+	stderr, err := bss.action_fn(bs, bss, dctx)
+	return stderr, err
 }
 
 // An artifact is a product of a build step.
@@ -772,7 +776,7 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		dctx.end_build_cache.CachedTargets[bs.target_config.Name] = cache_target
 	}()
 
-	dctx.build_state_writer.SetBuildFinished(bs.target_config.Name)
+	dctx.action_state_writer.SetActionFinished(bs.target_config.id)
 
 	// Check if this build can be promoted to the next level of the tree.
 	if bs.promotion_fn(bs) {
@@ -868,10 +872,10 @@ func build(dctx *DoContext, args []string) error {
 	}
 
 	var build_succeeded bool = false
-	dctx.build_state_writer.Start()
+	dctx.action_state_writer.Start()
 	// On stop, update the io writer if the build succeeded. That way
 	// the io build state does not interfere with the failed build io.
-	defer dctx.build_state_writer.Stop(build_succeeded)
+	defer dctx.action_state_writer.Stop(build_succeeded)
 
 	btree, err := tinfo.ConstructBuildTree(dctx, tp)
 	if err != nil {
@@ -1019,8 +1023,8 @@ type DoContext struct {
 	// The build cache state at the start of the build execution.
 	init_build_cache *BuildCache
 	// The build cache state at the end of the build execution.
-	end_build_cache    *BuildCache
-	build_state_writer *BuildStateWriter
+	end_build_cache     *BuildCache
+	action_state_writer *ActionStateWriter
 }
 
 func NewDoContext() *DoContext {
@@ -1030,9 +1034,9 @@ func NewDoContext() *DoContext {
 		build_tree_state_mu: &sync.Mutex{},
 		build_cancelled:     false,
 
-		init_build_cache:   NewBuildCache(),
-		end_build_cache:    NewBuildCache(),
-		build_state_writer: NewBuildStateWriter(6),
+		init_build_cache:    NewBuildCache(),
+		end_build_cache:     NewBuildCache(),
+		action_state_writer: NewActionStateWriter(6),
 	}
 }
 
@@ -1154,18 +1158,51 @@ func init() {
 	zerolog.SetGlobalLevel(loglevel)
 }
 
+type SubCommand struct {
+	name           string
+	usage          string
+	flagset        *flag.FlagSet
+	run_subcommand func(*DoContext, *SubCommand /* args */, []string) error
+}
+
+func run_builld_subcommand(dctx *DoContext, flagset *SubCommand, args []string) error {
+	return build(dctx, args)
+}
+
+func run_clean_subcommand(dctx *DoContext, flgset *SubCommand, args []string) error {
+	return clean(dctx)
+}
+
 func main() {
-	if len(os.Args) <= 1 {
-		// TODO: Print the help menu
-		return
+	var err error
+
+	// TODO(0000mz): Populate the flag set for each subcommand.
+	var subcommands []*SubCommand = []*SubCommand{
+		{name: "build", usage: "Build a target.", flagset: nil, run_subcommand: run_builld_subcommand},
+		{name: "clean", usage: "Clean up targets and cache.", flagset: nil, run_subcommand: run_clean_subcommand},
 	}
 
-	action := os.Args[1]
-	fmt.Printf("%s %s\n", color.New(color.FgCyan).SprintFunc()("do"), color.New(color.FgGreen).SprintFunc()(action))
+	fmt.Printf("%s - %s\n", color.New(color.FgCyan).SprintFunc()("do"), color.New(color.FgGreen).SprintFunc()("c action runner"))
+	if len(os.Args) <= 1 {
+		for _, subcmd := range subcommands {
+			fmt.Printf("\t%s\t%s\n", subcmd.name, subcmd.usage)
+		}
+		os.Exit(1)
+	}
+
+	var subcommand string = os.Args[1]
+	var has_subcommand bool = false
+	for _, flaginfo := range subcommands {
+		if flaginfo.name == subcommand {
+			has_subcommand = true
+		}
+	}
+	if !has_subcommand {
+		fmt.Printf("Error: Unknown command: %s\n", subcommand)
+		os.Exit(1)
+	}
 
 	dctx = NewDoContext()
-
-	var err error
 	err = dctx.SetupCoreDirs()
 	if err != nil {
 		panic(err)
@@ -1175,21 +1212,16 @@ func main() {
 		panic(err)
 	}
 
-	switch action {
-	case "build":
-		err = build(dctx, os.Args[2:])
-	case "clean":
-		err = clean(dctx)
-	default:
-		err = fmt.Errorf("unknown action: %s", action)
-	}
+	for _, flaginfo := range subcommands {
+		if flaginfo.name == subcommand {
+			err := flaginfo.run_subcommand(dctx, flaginfo, os.Args[2:])
 
-	logger.Info().Msgf("err = %v", err)
-	fmt.Printf("Error: %v\n", err)
-	exit_code := 0
-	if err != nil {
-		exit_code = 1
+			var exit_code int = 0
+			if err != nil {
+				exit_code = 1
+				fmt.Printf("Error: %v\n", err)
+			}
+			os.Exit(exit_code)
+		}
 	}
-
-	os.Exit(exit_code)
 }

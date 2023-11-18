@@ -1,21 +1,21 @@
 [Targets.my_library]
+Type = "static"
 Srcs = ["example_srcs/lib.c"]
 Hdrs = ["example_srcs/lib.h"]
-Type = "static"
 
 [Targets.my_binary]
+Type = "binary"
 Srcs = ["example_srcs/main.c"]
 Deps = ["my_library"]
-Type = "binary"
 
-[Targets.my_binary_with_zlib]
+[Targets.my_binary_with_glew]
+Type = "binary"
 Srcs = ["example_srcs/main.c"]
-Deps = ["my_library", "zlib"]
-Type = "binary"
+Deps = ["my_library", "glew"]
 
 
-[Targets.zlib]
-Git = "https://github.com/madler/zlib.git"
-Hash = "09155eaa2f9270dc4ed1fa13e2b4b2613e6e4851"
-Config = "make"
+[Targets.glew]
 Type = "external"
+Git = "https://github.com/edoren/glew.git"
+Hash = "5b995cab14f97231b48bc86b447be5e23b899626"
+Config = "make"
