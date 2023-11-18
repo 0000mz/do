@@ -23,5 +23,6 @@ output of `my_lib` with it.
 of artifacts.`
 
 ### Roadmap
-- Import and build external dependencies that are configured with CMake, Make and Configure Make.
-- Create test runner.
+- [ ] Import and build external dependencies that are configured with CMake, Make and Configure Make.
+- [ ] Create test runner.
+- [x] Compile commands generation.

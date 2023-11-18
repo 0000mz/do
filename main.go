@@ -29,6 +29,20 @@ var (
 	dctx    *DoContext
 )
 
+// Compile commands compilation database is a JSON file which consists
+// of an array of command objects. Each command object specifies one way a
+// translation unit is compiled in the project.
+// https://clang.llvm.org/docs/JSONCompilationDatabase.html
+type CompileCommandsDatabase struct {
+	Commands []*CompileCommandEntry `json:"commands"`
+}
+
+type CompileCommandEntry struct {
+	Directory string   `json:"directory"`
+	Arguments []string `json:"arguments"`
+	File      []string `json:"file"`
+}
+
 type CommandBuilder struct {
 	libdirs     map[string]bool
 	includedirs map[string]bool
@@ -94,8 +108,15 @@ const (
 	BuildModeCompile BuildMode = 2
 )
 
-func (cmd *CommandBuilder) Build(mode BuildMode) []string {
+func (cmd *CommandBuilder) Build(mode BuildMode, compiledb *CompileCommandsDatabase) []string {
 	cmdlst := []string{cmd.compiler}
+
+	var comp_entry CompileCommandEntry = CompileCommandEntry{}
+	cwd, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	comp_entry.Directory = cwd
 
 	switch mode {
 	case BuildModeExe:
@@ -107,6 +128,7 @@ func (cmd *CommandBuilder) Build(mode BuildMode) []string {
 	cmdlst = append(cmdlst, cmd.outfile)
 	for inputfile := range cmd.srcfiles {
 		cmdlst = append(cmdlst, inputfile)
+		comp_entry.File = append(comp_entry.File, inputfile)
 	}
 	for includedir := range cmd.includedirs {
 		cmdlst = append(cmdlst, "-I", includedir)
@@ -117,6 +139,10 @@ func (cmd *CommandBuilder) Build(mode BuildMode) []string {
 	for lib := range cmd.libs {
 		cmdlst = append(cmdlst, fmt.Sprintf("-l:%s", lib))
 	}
+
+	// Update the compile database with this command.
+	comp_entry.Arguments = cmdlst
+	compiledb.Commands = append(compiledb.Commands, &comp_entry)
 	return cmdlst
 }
 
@@ -910,6 +936,14 @@ func build(dctx *DoContext, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Serialize the compile database to an output file.
+	compile_db_file := filepath.Join(dctx.builddir_path, "compile_commands.json")
+	err = write_json_to_file(compile_db_file, dctx.compile_database)
+	if err != nil {
+		return err
+	}
+
 	// Save the new cache.
 	return dctx.RefreshCache()
 }
@@ -978,7 +1012,7 @@ func NewGccToolchain() *Toolchain {
 				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
 
 			cmdb = apply_static_libs(bs, cmdb)
-			return cmdb.Build(BuildModeExe)
+			return cmdb.Build(BuildModeExe, dctx.compile_database)
 		},
 		compile_object_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
 
@@ -989,7 +1023,7 @@ func NewGccToolchain() *Toolchain {
 				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
 
 			cmdb = apply_static_libs(bs, cmdb)
-			return cmdb.Build(BuildModeCompile)
+			return cmdb.Build(BuildModeCompile, dctx.compile_database)
 		},
 		build_static_lib_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
 			var outlib *Artifact = bss.outputs[0]
@@ -1047,6 +1081,7 @@ type DoContext struct {
 	// The build cache state at the end of the build execution.
 	end_build_cache     *BuildCache
 	action_state_writer *ActionStateWriter
+	compile_database    *CompileCommandsDatabase
 }
 
 func NewDoContext(enable_action_writer bool) *DoContext {
@@ -1059,6 +1094,7 @@ func NewDoContext(enable_action_writer bool) *DoContext {
 		init_build_cache:    NewBuildCache(),
 		end_build_cache:     NewBuildCache(),
 		action_state_writer: NewActionStateWriter(6, enable_action_writer),
+		compile_database:    &CompileCommandsDatabase{Commands: []*CompileCommandEntry{}},
 	}
 }
 
@@ -1112,23 +1148,24 @@ func (dctx *DoContext) LoadCache() error {
 	return nil
 }
 
-func (dctx *DoContext) RefreshCache() error {
-	new_cache_data, err := json.MarshalIndent(dctx.end_build_cache, "", "  ")
+func write_json_to_file(outfile string, data interface{}) error {
+	out_data, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	cachefile := filepath.Join(dctx.cachedir_path, "cache.json")
-	f, err := os.OpenFile(cachefile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+	f, err := os.OpenFile(outfile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = f.Write(new_cache_data)
-	if err != nil {
-		return err
-	}
+	_, err = f.Write(out_data)
 	return err
+}
+
+func (dctx *DoContext) RefreshCache() error {
+	cachefile := filepath.Join(dctx.cachedir_path, "cache.json")
+	return write_json_to_file(cachefile, dctx.end_build_cache)
 }
 
 func init() {
