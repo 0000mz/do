@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 )
 
 // These action functions are used to commit a build [sub]step.
@@ -125,6 +127,57 @@ func run_make_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *D
 		return stderr, err
 	}
 
-	fmt.Printf("Make command succeeded for %s, TODO: Check make output", project_dir)
+	// Iterate through the files in the project directory recursively and find all files within the
+	// output list.
+	// If an output is not found, an error will be returned.
+	var outputs_files map[string]bool = make(map[string]bool)
+	for _, el := range bss.outputs {
+		logger.Debug().Msgf("Expecting file to be produced from \"make\": %s", el.Fname)
+		outputs_files[el.Fname] = false
+	}
+	nb_found := 0
+
+	err = filepath.Walk(project_dir, func(path string, info os.FileInfo, err error) error {
+		var base string = filepath.Base(path)
+		base_found, has_base := outputs_files[base]
+		if has_base {
+			if base_found {
+				return fmt.Errorf("output file found multiple times: %s [fullpath: %s]", base, path)
+			}
+			logger.Info().Msgf("[make] Found file in project directory: fname = %s, path = %s", base, path)
+			outputs_files[base] = true
+
+			// Modify the output artifact directory to point to this directory so that the static link step knows the right directory
+			// to link from.
+			for _, artifact := range bss.outputs {
+				if base == artifact.Fname {
+					artifact.Dir = filepath.Dir(path)
+					break
+				}
+			}
+
+			nb_found++
+		}
+		if nb_found == len(outputs_files) {
+			// All artifacts found, do not need to continue walking the directory.
+			return io.EOF
+		}
+		return nil
+	})
+
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if nb_found != len(outputs_files) {
+		var not_found string = ""
+		for outfile, found := range outputs_files {
+			if !found {
+				not_found = fmt.Sprintf("%s %s", not_found, outfile)
+			}
+		}
+		logger.Info().Msgf("Failed to find artifacts: %s", not_found)
+		return nil, fmt.Errorf("failed to find following output files: %s", not_found)
+	}
+
 	return nil, nil
 }

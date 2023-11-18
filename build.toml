@@ -8,10 +8,10 @@ Type = "binary"
 Srcs = ["example_srcs/main.c"]
 Deps = ["my_library"]
 
-[Targets.my_binary_with_glew]
+[Targets.my_binary_with_ext]
 Type = "binary"
 Srcs = ["example_srcs/main.c"]
-Deps = ["my_library", "glew"]
+Deps = ["my_library", "heatshrink"]
 
 
 [Targets.glew]
@@ -19,3 +19,11 @@ Type = "external"
 Git = "https://github.com/edoren/glew.git"
 Hash = "5b995cab14f97231b48bc86b447be5e23b899626"
 Config = "make"
+
+[Targets.heatshrink]
+Type = "external"
+Git = "https://github.com/atomicobject/heatshrink.git"
+Hash = "7d419e1fa4830d0b919b9b6a91fe2fb786cf3280"
+Config = "make"
+OutStatic = ["libheatshrink_static.a"]
+OutDynamic = ["libheatshrink_dynamic.a"]

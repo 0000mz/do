@@ -136,17 +136,22 @@ type ActionStateWriter struct {
 	io_mu   *sync.Mutex
 
 	last_write_time time.Time
+	enabled         bool
 }
 
-func NewActionStateWriter(state_ct int) *ActionStateWriter {
+func NewActionStateWriter(state_ct int, enabled bool) *ActionStateWriter {
 	return &ActionStateWriter{
 		state_io_ct: state_ct,
 		actions:     make(map[string]*ActionState),
 		io_mu:       &sync.Mutex{},
+		enabled:     enabled,
 	}
 }
 
 func (io *ActionStateWriter) Start() {
+	if !io.enabled {
+		return
+	}
 	io.writer = uilive.New()
 	io.writer.Start()
 	io.update_action_state_io()
@@ -163,6 +168,9 @@ func (io *ActionStateWriter) Stop(update_state bool) {
 }
 
 func (io *ActionStateWriter) AddAction(action_id, action_type, action_name string) {
+	if io.writer == nil {
+		return
+	}
 	io.actions[action_id] = &ActionState{
 		action_type: action_type,
 		action_name: action_name,
@@ -172,6 +180,9 @@ func (io *ActionStateWriter) AddAction(action_id, action_type, action_name strin
 }
 
 func (io *ActionStateWriter) SetActionFinished(action_id string) {
+	if io.writer == nil {
+		return
+	}
 	action_state, has_action := io.actions[action_id]
 	if has_action {
 		action_state.active = false
@@ -386,6 +397,12 @@ type TargetConfig struct {
 	// For external, set to "external".
 	Type string `json:"-"`
 
+	// For external dependencies, this will list the artifacts produced.
+	// During the build step of external dependencies, these files must be extracted
+	// if the build succeeds and used as input to the next step of the build.
+	OutStatic  []string `json:"out_static"`
+	OutDynamic []string `json:"out_dynamic"`
+
 	id string
 }
 
@@ -573,6 +590,10 @@ func (t *TargetConfig) external_build_step(dctx *DoContext) (*BuildStep, error) 
 	var project_pulldir string = git_pull_bss.outputs[0].Dir
 	external_build_bss := &BuildSubStep{
 		inputs: []*Artifact{{Dir: project_pulldir, Fname: t.Config}},
+		outputs: apply(
+			append(t.OutStatic, t.OutDynamic...),
+			func(static_lib string) *Artifact { return &Artifact{Fname: static_lib} },
+		),
 		action_fn: func(bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
 			return external_build_action_fn(project_pulldir, bs, bss, dc)
 		},
@@ -620,7 +641,6 @@ func NewTargetParser(config_file string) (*TargetParser, error) {
 		tinfo.Name = tname
 		tparser.targets[tname] = tinfo
 	}
-	logger.Debug().Msgf("tparser: %#v", tparser)
 	return &tparser, nil
 }
 
@@ -712,6 +732,7 @@ type BuildStep struct {
 }
 
 func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *bytes.Buffer, completech chan bool) {
+	logger.Info().Msgf("Running buiild step: %s", bs.target_config.Name)
 	func() {
 		dctx.build_tree_state_mu.Lock()
 		defer dctx.build_tree_state_mu.Unlock()
@@ -723,6 +744,7 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 	// Check if this build step needs to be refreshed. If not, mark the build as
 	// complete.
 	if bs.needs_refresh {
+		logger.Info().Msgf("%s: refreshing build", bs.target_config.Name)
 		var bss *BuildSubStep = bs.steps
 		for bss != nil {
 			stderr, err := bss.Build(bs, dctx)
@@ -738,6 +760,7 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		}
 	} else {
 		// Get the output artifacts from the build cache.
+		logger.Info().Msgf("%s: using cache", bs.target_config.Name)
 		func() {
 			dctx.build_tree_state_mu.Lock()
 			defer dctx.build_tree_state_mu.Unlock()
@@ -864,7 +887,6 @@ func build(dctx *DoContext, args []string) error {
 	if err != nil {
 		return err
 	}
-	logger.Debug().Msgf("Target info: %#v", tinfo)
 
 	err = tinfo.Validate()
 	if err != nil {
@@ -1027,7 +1049,7 @@ type DoContext struct {
 	action_state_writer *ActionStateWriter
 }
 
-func NewDoContext() *DoContext {
+func NewDoContext(enable_action_writer bool) *DoContext {
 	return &DoContext{
 		c_toolchain: NewGccToolchain(),
 
@@ -1036,7 +1058,7 @@ func NewDoContext() *DoContext {
 
 		init_build_cache:    NewBuildCache(),
 		end_build_cache:     NewBuildCache(),
-		action_state_writer: NewActionStateWriter(6),
+		action_state_writer: NewActionStateWriter(6, enable_action_writer),
 	}
 }
 
@@ -1117,7 +1139,7 @@ func init() {
 	if has_bool_arg("logtostderr") {
 		outlog = os.Stderr
 	} else {
-		logfile, err = os.CreateTemp("", "")
+		logfile, err = os.CreateTemp("", "do-log")
 		if err != nil {
 			os.Exit(1)
 		}
@@ -1128,6 +1150,9 @@ func init() {
 				fmt.Printf("Writing logs to: %s\n", logfile.Name())
 			}
 		}()
+	}
+	if outlog == nil {
+		panic("logger output not set")
 	}
 
 	logger = zerolog.New(zerolog.ConsoleWriter{
@@ -1156,13 +1181,15 @@ func init() {
 		}
 	}
 	zerolog.SetGlobalLevel(loglevel)
+	logger.Info().Msg("Zerolog configured")
 }
 
 type SubCommand struct {
-	name           string
-	usage          string
-	flagset        *flag.FlagSet
-	run_subcommand func(*DoContext, *SubCommand /* args */, []string) error
+	name            string
+	usage           string
+	check_core_dirs bool
+	flagset         *flag.FlagSet
+	run_subcommand  func(*DoContext, *SubCommand /* args */, []string) error
 }
 
 func run_builld_subcommand(dctx *DoContext, flagset *SubCommand, args []string) error {
@@ -1207,9 +1234,9 @@ func main() {
 
 	// TODO(0000mz): Populate the flag set for each subcommand.
 	var subcommands []*SubCommand = []*SubCommand{
-		{name: "init", usage: "Initialize a new c project.", flagset: nil, run_subcommand: run_init_subcommand},
-		{name: "build", usage: "Build a target.", flagset: nil, run_subcommand: run_builld_subcommand},
-		{name: "clean", usage: "Clean up targets and cache.", flagset: nil, run_subcommand: run_clean_subcommand},
+		{name: "init", usage: "Initialize a new c project.", check_core_dirs: false, flagset: nil, run_subcommand: run_init_subcommand},
+		{name: "build", usage: "Build a target.", flagset: nil, check_core_dirs: true, run_subcommand: run_builld_subcommand},
+		{name: "clean", usage: "Clean up targets and cache.", check_core_dirs: true, flagset: nil, run_subcommand: run_clean_subcommand},
 	}
 
 	fmt.Printf("%s - %s\n", color.New(color.FgHiCyan).SprintFunc()("do"), color.New(color.FgHiGreen).SprintFunc()("c action runner"))
@@ -1232,18 +1259,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	dctx = NewDoContext()
-	err = dctx.SetupCoreDirs()
-	if err != nil {
-		panic(err)
-	}
-	err = dctx.LoadCache()
-	if err != nil {
-		panic(err)
-	}
+	disable_action_writer := has_bool_arg("disable_action_writer")
+	dctx = NewDoContext(!disable_action_writer)
 
 	for _, flaginfo := range subcommands {
 		if flaginfo.name == subcommand {
+			if flaginfo.check_core_dirs {
+				err = dctx.SetupCoreDirs()
+				if err != nil {
+					panic(err)
+				}
+				err = dctx.LoadCache()
+				if err != nil {
+					panic(err)
+				}
+			}
+
 			err := flaginfo.run_subcommand(dctx, flaginfo, os.Args[2:])
 
 			var exit_code int = 0
