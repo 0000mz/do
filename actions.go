@@ -155,7 +155,6 @@ func run_make_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *D
 					break
 				}
 			}
-
 			nb_found++
 		}
 		if nb_found == len(outputs_files) {
@@ -179,5 +178,12 @@ func run_make_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *D
 		return nil, fmt.Errorf("failed to find following output files: %s", not_found)
 	}
 
+	// Any include directory should be added as an artifact so that it can be added to the upstream
+	// compile commands.
+	for _, relative_include_dir := range bs.target_config.IncludeDirs {
+		full_include_dir := filepath.Join(project_dir, relative_include_dir)
+		logger.Info().Msgf("Adding include path as artifact: %s", full_include_dir)
+		bss.outputs = append(bss.outputs, &Artifact{IncludeDir: full_include_dir})
+	}
 	return nil, nil
 }

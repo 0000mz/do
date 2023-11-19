@@ -428,6 +428,10 @@ type TargetConfig struct {
 	// if the build succeeds and used as input to the next step of the build.
 	OutStatic  []string `json:"out_static"`
 	OutDynamic []string `json:"out_dynamic"`
+	// Relative path to all of the include directories from a project. These will
+	// be added to the compile commands of the target linking against this remote
+	// dependency.
+	IncludeDirs []string `json:"include_dirs"`
 
 	id string
 }
@@ -722,6 +726,8 @@ type Artifact struct {
 	Fname string `json:"fname"`
 	// The url where the artifact lives.
 	Url string `json:"url"`
+	// Headers can be exported from a target to be used in its dependant.
+	IncludeDir string `json:"header_dir"`
 }
 
 func (a *Artifact) Exists() bool {
@@ -984,16 +990,21 @@ type Toolchain struct {
 
 func NewGccToolchain() *Toolchain {
 
-	apply_static_libs := func(bs *BuildStep, cmdb *CommandBuilder) *CommandBuilder {
+	apply_common_args := func(bs *BuildStep, cmdb *CommandBuilder) *CommandBuilder {
 		// Collect the artifacts from the dependants and append it to the command.
 		// This assumes that every dependant build step produces a static library.
-		var static_libs []*Artifact = make([]*Artifact, 0)
+		var artifacts []*Artifact = make([]*Artifact, 0)
 		for _, dep_bs := range bs.dependants {
-			static_libs = append(static_libs, dep_bs.output_artifacts...)
+			artifacts = append(artifacts, dep_bs.output_artifacts...)
 		}
 
-		for _, static_lib := range static_libs {
-			cmdb = cmdb.AddLibDir(static_lib.Dir).AddLibs(static_lib.Fname)
+		for _, artifact := range artifacts {
+			if len(artifact.Fname) > 0 {
+				cmdb = cmdb.AddLibDir(artifact.Dir).AddLibs(artifact.Fname)
+			}
+			if len(artifact.IncludeDir) > 0 {
+				cmdb = cmdb.AddIncludeDirs(artifact.IncludeDir)
+			}
 		}
 		return cmdb
 	}
@@ -1011,7 +1022,7 @@ func NewGccToolchain() *Toolchain {
 				AddOutput(exepath).
 				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
 
-			cmdb = apply_static_libs(bs, cmdb)
+			cmdb = apply_common_args(bs, cmdb)
 			return cmdb.Build(BuildModeExe, dctx.compile_database)
 		},
 		compile_object_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
@@ -1022,7 +1033,7 @@ func NewGccToolchain() *Toolchain {
 				AddOutput(outobj.Fullpath()).
 				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
 
-			cmdb = apply_static_libs(bs, cmdb)
+			cmdb = apply_common_args(bs, cmdb)
 			return cmdb.Build(BuildModeCompile, dctx.compile_database)
 		},
 		build_static_lib_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
