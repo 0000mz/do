@@ -787,7 +787,9 @@ func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) (*bytes.Buffer, e
 			return stderr, err
 		}
 		// Update the cache with the output artifacts from this build sub-step
+		dctx.build_tree_state_mu.Lock()
 		err = dctx.end_build_cache.UpdateBuildSubStepCacheArtifacts(bs.target_config, bss)
+		dctx.build_tree_state_mu.Unlock()
 		return nil, err
 	} else {
 		// Get the output artifacts from the build sub-step cache.
@@ -798,6 +800,7 @@ func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) (*bytes.Buffer, e
 			cached_artifacts, err := dctx.init_build_cache.GetCachedBuildSubstepArtifacts(bs.target_config, bss.identifier)
 			if err != nil {
 				bss.outputs = append(bss.outputs, cached_artifacts...)
+				err = dctx.end_build_cache.UpdateBuildSubStepCacheArtifacts(bs.target_config, bss)
 			}
 			return err
 		}()
