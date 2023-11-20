@@ -1,5 +1,7 @@
 package main
 
+import "os"
+
 // Build identnfier is used for identifying different build sub steps
 type BuildIdentifier int
 
@@ -23,17 +25,17 @@ type TargetDefinition struct {
 	// Similar to `compute_build_step_refresh` but for the sub steps of a build step.
 	// The key of the map is the unique idenrifier of the build sub step and the value
 	// is the function that determines whether or not the sub step needs to be refreshed.
-	compute_build_sub_step_refresh map[BuildIdentifier]func(target *TargetConfig) bool
+	compute_build_sub_step_refresh map[BuildIdentifier]func(dctx *DoContext, target *TargetConfig) bool
 }
 
 var target_definitions = map[string]TargetDefinition{
-	"static":  {Type: "static", compute_build_step_refresh: compute_source_refresh, compute_build_sub_step_refresh: make(map[BuildIdentifier]func(target *TargetConfig) bool)},
-	"dynamic": {Type: "dynamic", compute_build_step_refresh: compute_source_refresh, compute_build_sub_step_refresh: make(map[BuildIdentifier]func(target *TargetConfig) bool)},
-	"binary":  {Type: "binary", compute_build_step_refresh: compute_source_refresh, compute_build_sub_step_refresh: make(map[BuildIdentifier]func(target *TargetConfig) bool)},
+	"static":  {Type: "static", compute_build_step_refresh: compute_source_refresh, compute_build_sub_step_refresh: make(map[BuildIdentifier]func(dctx *DoContext, target *TargetConfig) bool)},
+	"dynamic": {Type: "dynamic", compute_build_step_refresh: compute_source_refresh, compute_build_sub_step_refresh: make(map[BuildIdentifier]func(dctx *DoContext, target *TargetConfig) bool)},
+	"binary":  {Type: "binary", compute_build_step_refresh: compute_source_refresh, compute_build_sub_step_refresh: make(map[BuildIdentifier]func(dctx *DoContext, target *TargetConfig) bool)},
 	"external": {
 		Type:                       "external",
 		compute_build_step_refresh: force_refresh,
-		compute_build_sub_step_refresh: map[BuildIdentifier]func(target *TargetConfig) bool{
+		compute_build_sub_step_refresh: map[BuildIdentifier]func(dctx *DoContext, target *TargetConfig) bool{
 			BuildId_GitPull: should_refresh_git_pull,
 		},
 	},
@@ -43,12 +45,19 @@ func force_refresh(target *TargetConfig, cache *BuildCache) bool {
 	return true
 }
 
-func should_refresh_git_pull(target *TargetConfig) bool {
-	panic("TODO Implement refresh for git pull")
+func should_refresh_git_pull(dctx *DoContext, target *TargetConfig) bool {
+	git_pull_path := get_git_pull_path(dctx, target.Git, target.Hash)
+	// TODO: This only checks that the expected destionation of the git repo exists.
+	// Add a check to make sure that the remote for this repo is the one specified in the config
+	// and also that it is checked out to the right commit hash.
+	if stat, err := os.Stat(git_pull_path); err == nil && stat.IsDir() {
+		return false
+	}
+	return true
 }
 
 func compute_source_refresh(target *TargetConfig, cache *BuildCache) bool {
-	tcache, is_cached := cache.CachedTargets[target.Name]
+	tcache, is_cached := cache.CachedBuildStep[target.Name]
 	if !is_cached {
 		return true
 	}
@@ -86,14 +95,14 @@ func compute_source_refresh(target *TargetConfig, cache *BuildCache) bool {
 
 	// Check if the artifacts exist.
 	for _, artifact := range tcache.Artifacts {
-		if fa, is_fa := artifact.Get().(*FileArtifact); is_fa && fa.Exists() {
+		if fa, is_fa := artifact.GetArtifact().Get().(*FileArtifact); is_fa && fa.Exists() {
 			return true
 		}
 	}
 	return false
 }
 
-func (t *TargetDefinition) CheckBuildSubstepRefresh(substep_id BuildIdentifier, target *TargetConfig) bool {
+func (t *TargetDefinition) CheckBuildSubstepRefresh(ctx *DoContext, substep_id BuildIdentifier, target *TargetConfig) bool {
 	if substep_id == 0 {
 		panic("invalid build substep identifier")
 	}
@@ -101,5 +110,5 @@ func (t *TargetDefinition) CheckBuildSubstepRefresh(substep_id BuildIdentifier, 
 	if !has_refresh {
 		return true // needs refresh
 	}
-	return refresh_fn(target)
+	return refresh_fn(ctx, target)
 }

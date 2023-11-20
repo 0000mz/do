@@ -209,11 +209,13 @@ func (io *ActionStateWriter) AddAction(action_id, action_type, action_name strin
 	if io.writer == nil {
 		return
 	}
+	io.io_mu.Lock()
 	io.actions[action_id] = &ActionState{
 		action_type: action_type,
 		action_name: action_name,
 		active:      true,
 	}
+	io.io_mu.Unlock()
 	io.update_action_state_io()
 }
 
@@ -221,7 +223,9 @@ func (io *ActionStateWriter) SetActionFinished(action_id string) {
 	if io.writer == nil {
 		return
 	}
+	io.io_mu.Lock()
 	action_state, has_action := io.actions[action_id]
+	io.io_mu.Unlock()
 	if has_action {
 		action_state.active = false
 		io.update_action_state_io()
@@ -336,14 +340,18 @@ func bytearr_equal(a []byte, b []byte) bool {
 	return true
 }
 
+func get_git_pull_path(dctx *DoContext, giturl, hash string) string {
+	projname := filepath.Base(giturl)
+	return filepath.Join(dctx.builddir_path, "external", fmt.Sprintf("%s-%s", projname, hash))
+}
+
 func create_git_pull_buildstep(t *TargetConfig) (*BuildSubStep, error) {
 
 	if len(t.Git) == 0 || len(t.Hash) == 0 {
 		return nil, fmt.Errorf("no git remote or hash specified for git pull buildstep")
 	}
 
-	projname := filepath.Base(t.Git)
-	export_dir := filepath.Join(dctx.builddir_path, "external", fmt.Sprintf("%s-%s", projname, t.Hash))
+	export_dir := get_git_pull_path(dctx, t.Git, t.Hash)
 	bss := &BuildSubStep{
 		inputs:      []*Artifact{create_git_input_artifact(t.Git, t.Hash)},
 		outputs:     []*Artifact{create_directory_artifact(export_dir)},
@@ -453,23 +461,34 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 		panic("Build step not set during construction of build tree.")
 	}
 
+	// Set initial refresh state for build steps and build sub steps.
+	bs.needs_refresh = true
+	var substep *BuildSubStep = bs.steps
+	for substep != nil {
+		substep.needs_refresh = true
+		substep = substep.next
+	}
+
 	// Check if any of the files this target depends on have changed.
 	target_def, has_target_definition := target_definitions[t.Type]
-	bs.needs_refresh = true
 	if has_target_definition {
 		bs.needs_refresh = target_def.compute_build_step_refresh(t, dctx.init_build_cache)
 	}
-	if !bs.needs_refresh {
+	logger.Debug().Msgf("Build Step %s: needs refresh = %v", t.Name, bs.needs_refresh)
+
+	// If the build step is not cached, check if build sub-steps are cached.
+	if bs.needs_refresh {
 		var substep *BuildSubStep = bs.steps
 		for substep != nil {
-			substep.needs_refresh = target_def.CheckBuildSubstepRefresh(substep.identifier, t)
+			substep.needs_refresh = target_def.CheckBuildSubstepRefresh(dctx, substep.identifier, t)
+			logger.Debug().Msgf("Build Step %s, sub step %v: needs refresh = %v", t.Name, substep.identifier, substep.needs_refresh)
 			substep = substep.next
 		}
 	}
 
 	bs.target_config = t
 	bs.dependants = deps_buildsteps
-	// Set the parent for for eahc of the deps to the bs
+	// Set the parent for for each of the deps to the bs
 	for _, dep := range bs.dependants {
 		// If the dependant needs to be refreshed, then so does the parent,
 		// regardless of what its previous value was.
@@ -762,8 +781,28 @@ func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) (*bytes.Buffer, e
 		}
 	}()
 
-	stderr, err := bss.action_fn(bs, bss, dctx)
-	return stderr, err
+	if bss.needs_refresh {
+		stderr, err := bss.action_fn(bs, bss, dctx)
+		if err != nil {
+			return stderr, err
+		}
+		// Update the cache with the output artifacts from this build sub-step
+		err = dctx.end_build_cache.UpdateBuildSubStepCacheArtifacts(bs.target_config, bss)
+		return nil, err
+	} else {
+		// Get the output artifacts from the build sub-step cache.
+		logger.Info().Msgf("%s-%v: using build sub-step cache", bs.target_config.Name, bss.identifier)
+		err = func() error {
+			dctx.build_tree_state_mu.Lock()
+			defer dctx.build_tree_state_mu.Unlock()
+			cached_artifacts, err := dctx.init_build_cache.GetCachedBuildSubstepArtifacts(bs.target_config, bss.identifier)
+			if err != nil {
+				bss.outputs = append(bss.outputs, cached_artifacts...)
+			}
+			return err
+		}()
+		return nil, err
+	}
 }
 
 // Build step define how to build a specific transition unit
@@ -791,7 +830,7 @@ type BuildStep struct {
 }
 
 func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *bytes.Buffer, completech chan bool) {
-	logger.Info().Msgf("Running buiild step: %s", bs.target_config.Name)
+	logger.Info().Msgf("Running build step: %s", bs.target_config.Name)
 	func() {
 		dctx.build_tree_state_mu.Lock()
 		defer dctx.build_tree_state_mu.Unlock()
@@ -805,6 +844,11 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 	if bs.needs_refresh {
 		logger.Info().Msgf("%s: refreshing build", bs.target_config.Name)
 		var bss *BuildSubStep = bs.steps
+
+		for i, artifact := range bss.inputs {
+			logger.Debug().Msgf("input artifact [%d] for build: %s-%v: %#v", i, bs.target_config.Name, bss.identifier, artifact.Impl)
+		}
+
 		for bss != nil {
 			stderr, err := bss.Build(bs, dctx)
 			if err != nil {
@@ -819,16 +863,19 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		}
 	} else {
 		// Get the output artifacts from the build cache.
-		logger.Info().Msgf("%s: using cache", bs.target_config.Name)
+		logger.Info().Msgf("%s: using build step cache", bs.target_config.Name)
 		func() {
 			dctx.build_tree_state_mu.Lock()
 			defer dctx.build_tree_state_mu.Unlock()
 
-			cached, is_cached := dctx.init_build_cache.CachedTargets[bs.target_config.Name]
+			cached, is_cached := dctx.init_build_cache.CachedBuildStep[bs.target_config.Name]
 			if !is_cached {
 				panic("BuildStep marked as cached but no cache entry found.")
 			}
-			bs.output_artifacts = cached.Artifacts
+			bs.output_artifacts = apply(cached.Artifacts, func(ca *CacheableArtifact) *Artifact { return ca.GetArtifact() })
+			for i, artifact := range bs.output_artifacts {
+				logger.Debug().Msgf("cached build step -> %s: Output artifact[%d](type = %s): %#v", bs.target_config.Name, i, get_artifact_type(artifact), artifact.Impl)
+			}
 		}()
 	}
 
@@ -849,21 +896,16 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		}
 		bs.build_complete = true
 
-		cache_target := &BuildStepCache{
-			Target:     bs.target_config,
-			FileHashes: hashes,
-			Artifacts:  bs.output_artifacts,
-			SubSteps:   []*BuildSubStepCache{},
-		}
-
-		dctx.end_build_cache.CachedTargets[bs.target_config.Name] = cache_target
+		target_cache := dctx.end_build_cache.GetBuildCacheForTarget(bs.target_config)
+		target_cache.FileHashes = hashes
+		target_cache.Artifacts = apply(bs.output_artifacts, func(a *Artifact) *CacheableArtifact { return a.GetCacheableArtiact() })
 	}()
 
 	dctx.action_state_writer.SetActionFinished(bs.target_config.id)
 
 	// Check if this build can be promoted to the next level of the tree.
 	if bs.promotion_fn(bs) {
-		logger.Debug().Msg("Promoting build to next level.")
+		logger.Debug().Msgf("Promoting build to next level -> %s", bs.parent.target_config.Name)
 		go bs.parent.Build(dctx, errch, stderrch, completech)
 	}
 
@@ -1021,17 +1063,30 @@ func NewGccToolchain() *Toolchain {
 	apply_common_args := func(bs *BuildStep, cmdb *CommandBuilder) *CommandBuilder {
 		// Collect the artifacts from the dependants and append it to the command.
 		// This assumes that every dependant build step produces a static library.
+		var target_name string = bs.target_config.Name
 		var artifacts []*Artifact = make([]*Artifact, 0)
-		for _, dep_bs := range bs.dependants {
+		for i, dep_bs := range bs.dependants {
+			for j, dep_art := range dep_bs.output_artifacts {
+				logger.Debug().Msgf("for target %s: dep[%d] output artifact[%d] = %#v", target_name, i, j, dep_art.Impl)
+			}
 			artifacts = append(artifacts, dep_bs.output_artifacts...)
 		}
 
 		for _, artifact := range artifacts {
+			var action_committed bool = false
 			if fa, is_fa := artifact.Get().(*FileArtifact); is_fa && len(fa.Fname) > 0 {
+				logger.Debug().Msgf("for target %s: setting file artifact as lib: %#v", target_name, *fa)
 				cmdb = cmdb.AddLibDir(fa.Dir).AddLibs(fa.Fname)
+				action_committed = true
 			}
 			if da, is_da := artifact.Get().(*DirectoryArtifact); is_da && len(da.Dir) > 0 {
+				logger.Debug().Msgf("for target %s: setting directory artifact as include dir: %#v", target_name, *da)
 				cmdb = cmdb.AddIncludeDirs(da.Dir)
+				action_committed = true
+			}
+
+			if !action_committed {
+				logger.Error().Msgf("for target %s: No action committed for artifact: %v", target_name, artifact.Impl)
 			}
 		}
 		return cmdb
@@ -1104,6 +1159,14 @@ func NewGccToolchain() *Toolchain {
 }
 
 type BuildSubStepCache struct {
+	// Artifacts produced during a build sub-step.
+	Artifacts []*CacheableArtifact `json:"artifacts"`
+}
+
+func NewBuildSubStepCache() *BuildSubStepCache {
+	return &BuildSubStepCache{
+		Artifacts: []*CacheableArtifact{},
+	}
 }
 
 type BuildStepCache struct {
@@ -1113,9 +1176,26 @@ type BuildStepCache struct {
 	// whether or not a target needs to be rebuilt.
 	FileHashes map[string][]byte `json:"file-hashes"`
 	// Cthe location of artifacts produced by the target.
-	Artifacts []*Artifact `json:"artifacts"`
+	Artifacts []*CacheableArtifact `json:"build_step_artifacts"`
 	// Either full steps can be cached or sub steps can be cached.
-	SubSteps []*BuildSubStepCache `json:"sub_steps"`
+	SubSteps map[BuildIdentifier]*BuildSubStepCache `json:"sub_steps"`
+}
+
+func NewBuildStepCache(t *TargetConfig) *BuildStepCache {
+	return &BuildStepCache{
+		Target:   t,
+		SubSteps: map[BuildIdentifier]*BuildSubStepCache{},
+	}
+}
+
+func (bsc *BuildCache) UpdateBuildSubStepCacheArtifacts(t *TargetConfig, bss *BuildSubStep) error {
+	target_cache := bsc.GetBuildCacheForTarget(t)
+	target_cache.SubSteps[bss.identifier] = NewBuildSubStepCache()
+
+	bssc := target_cache.SubSteps[bss.identifier]
+	bssc.Artifacts = apply(bss.outputs, func(a *Artifact) *CacheableArtifact { return a.GetCacheableArtiact() })
+
+	return nil
 }
 
 // The build cache stores information about the targets that were built and
@@ -1123,7 +1203,32 @@ type BuildStepCache struct {
 // in future builds whether or not a target should be rebuilt and where to find the
 // cached artifacts.
 type BuildCache struct {
-	CachedTargets map[string]*BuildStepCache `json:"cached-targets"`
+	CachedBuildStep map[string]*BuildStepCache `json:"cached-targets"`
+}
+
+// Return the build cache for the given target.
+// If a build cache entry does not exist for the target with the given `target_name`,
+// a new build cache entry will be created and returned.
+func (bc *BuildCache) GetBuildCacheForTarget(t *TargetConfig) *BuildStepCache {
+	var target_name string = t.Name
+	cbs, has_cbs := bc.CachedBuildStep[target_name]
+	if has_cbs {
+		return cbs
+	}
+	bc.CachedBuildStep[target_name] = NewBuildStepCache(t)
+	return bc.CachedBuildStep[target_name]
+}
+
+func (bc *BuildCache) GetCachedBuildSubstepArtifacts(t *TargetConfig, bss_id BuildIdentifier) ([]*Artifact, error) {
+	cbs, has_cbs := bc.CachedBuildStep[t.Name]
+	if !has_cbs {
+		return nil, fmt.Errorf("cannot get cached build substep for un-cached target: %s", t.Name)
+	}
+	bssc, has_bssc := cbs.SubSteps[bss_id]
+	if !has_bssc {
+		return nil, fmt.Errorf("target %s has build cache but no build sub-step cache for build id %v", t.Name, bss_id)
+	}
+	return apply(bssc.Artifacts, func(ca *CacheableArtifact) *Artifact { return ca.GetArtifact() }), nil
 }
 
 func ensure_dir(dirname string) {
@@ -1136,7 +1241,7 @@ func ensure_dir(dirname string) {
 
 func NewBuildCache() *BuildCache {
 	return &BuildCache{
-		CachedTargets: make(map[string]*BuildStepCache, 0),
+		CachedBuildStep: make(map[string]*BuildStepCache, 0),
 	}
 }
 
