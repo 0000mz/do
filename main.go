@@ -1018,7 +1018,7 @@ func build(dctx *DoContext, args []string) error {
 
 	// Serialize the compile database to an output file.
 	compile_db_file := filepath.Join(dctx.builddir_path, "compile_commands.json")
-	err = write_json_to_file(compile_db_file, dctx.compile_database)
+	err = write_json_to_file(compile_db_file, dctx.compile_database.Commands)
 	if err != nil {
 		return err
 	}
