@@ -71,51 +71,74 @@ func produce_static_lib_action(bs *BuildStep, bss *BuildSubStep, dctx *DoContext
 
 func pull_git_action(bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
 	if len(bss.inputs) != 1 {
-		return nil, fmt.Errorf("expected only 1 input for git-pull action, received %d", len(bss.inputs))
+		panic(fmt.Sprintf("expected only 1 input for git-pull action, received %d", len(bss.inputs)))
 	}
 	if len(bss.outputs) != 1 {
-		return nil, fmt.Errorf("expected only 1 output for git-pull action, received %d", len(bss.outputs))
+		panic(fmt.Sprintf("expected only 1 output for git-pull action, received %d", len(bss.outputs)))
 	}
 
-	var github_repo string = bss.inputs[0].Url
-	var commit_hash string = bss.inputs[0].Fname
-	var destination string = bss.outputs[0].Dir
+	var outdir_artifact *DirectoryArtifact
+	var git_artifact *GitInputArtifact
+
+	git_artifact, is_ga := bss.inputs[0].Get().(*GitInputArtifact)
+	if !is_ga {
+		panic("Expected inputs[0] to be a git input artifact")
+	}
+	outdir_artifact, is_da := bss.outputs[0].Get().(*DirectoryArtifact)
+	if !is_da {
+		panic("Expected outputs[0] to be a directory artifact")
+	}
 
 	// TODO(0000mz): If the repo is already downloaded, skip pulling it again.
-	if _, err := os.Stat(destination); err == nil {
-		err := os.RemoveAll(destination)
+	if _, err := os.Stat(outdir_artifact.Dir); err == nil {
+		err := os.RemoveAll(outdir_artifact.Dir)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	stdout, stderr, err := run_command([]string{"git", "clone", github_repo, destination})
+	stdout, stderr, err := run_command([]string{"git", "clone", git_artifact.Url, outdir_artifact.Dir})
 	if err != nil {
 		return stderr, err
 	}
 
 	logger.Debug().Msgf("Stdout command output: %s", string(stdout))
 
-	_, stderr, err = run_command_dir([]string{"git", "checkout", commit_hash}, destination)
+	_, stderr, err = run_command_dir([]string{"git", "checkout", git_artifact.Hash}, outdir_artifact.Dir)
 	if err != nil {
 		return stderr, err
 	}
 	return nil, nil
 }
 
+type BuildConfigType int
+
+const (
+	Buildconfig_Undefined BuildConfigType = 0
+	BuildConfig_Make      BuildConfigType = 1
+	BuildConfig_CMake     BuildConfigType = 2
+	BuildConfig_HdrOnly   BuildConfigType = 3
+)
+
+func get_external_build_config_type(config_name string) (BuildConfigType, error) {
+	switch config_name {
+	case "make":
+		return BuildConfig_Make, nil
+	case "cmake":
+		return BuildConfig_CMake, nil
+	case "headeronly":
+		return BuildConfig_HdrOnly, nil
+	}
+	return Buildconfig_Undefined, fmt.Errorf("unknown external build config type: %s", config_name)
+}
+
 // External build step used for building projects with for the specific type: i.e. make, configure-make, etc...
 // @params
 //   - [0] project directory: The root directory path of the project that needs to be built.
-var external_build_steps = map[string]func(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error){
-	"make": run_make_action,
-}
-
-func get_all_all_external_build_configs() []string {
-	var configs []string = []string{}
-	for k := range external_build_steps {
-		configs = append(configs, k)
-	}
-	return configs
+var external_build_steps = map[BuildConfigType]func(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error){
+	BuildConfig_Make:    run_make_action,
+	BuildConfig_CMake:   run_cmake_action,
+	BuildConfig_HdrOnly: run_headeronly_action,
 }
 
 func run_make_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
@@ -131,9 +154,12 @@ func run_make_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *D
 	// output list.
 	// If an output is not found, an error will be returned.
 	var outputs_files map[string]bool = make(map[string]bool)
-	for _, el := range bss.outputs {
-		logger.Debug().Msgf("Expecting file to be produced from \"make\": %s", el.Fname)
-		outputs_files[el.Fname] = false
+	for _, artifact := range bss.outputs {
+		vague_file, is_vfa := artifact.Get().(*VagueFileArtifact)
+		if is_vfa {
+			logger.Debug().Msgf("Expecting file to be produced from \"make\": %s", vague_file.Fname)
+			outputs_files[vague_file.Fname] = false
+		}
 	}
 	nb_found := 0
 
@@ -150,8 +176,9 @@ func run_make_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *D
 			// Modify the output artifact directory to point to this directory so that the static link step knows the right directory
 			// to link from.
 			for _, artifact := range bss.outputs {
-				if base == artifact.Fname {
-					artifact.Dir = filepath.Dir(path)
+				vfa, is_vfa := artifact.Get().(*VagueFileArtifact)
+				if is_vfa && vfa.Fname == base {
+					vfa.PromoteAndReplace(filepath.Dir(path), artifact)
 					break
 				}
 			}
@@ -180,10 +207,23 @@ func run_make_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *D
 
 	// Any include directory should be added as an artifact so that it can be added to the upstream
 	// compile commands.
+	set_include_dirs(project_dir, bs, bss)
+	return nil, nil
+}
+
+func run_cmake_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
+	return nil, fmt.Errorf("unimpl")
+}
+
+func run_headeronly_action(project_dir string, bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
+	set_include_dirs(project_dir, bs, bss)
+	return nil, nil
+}
+
+func set_include_dirs(project_dir string, bs *BuildStep, bss *BuildSubStep) {
 	for _, relative_include_dir := range bs.target_config.IncludeDirs {
 		full_include_dir := filepath.Join(project_dir, relative_include_dir)
 		logger.Info().Msgf("Adding include path as artifact: %s", full_include_dir)
-		bss.outputs = append(bss.outputs, &Artifact{IncludeDir: full_include_dir})
+		bss.outputs = append(bss.outputs, create_directory_artifact(full_include_dir))
 	}
-	return nil, nil
 }

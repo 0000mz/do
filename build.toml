@@ -11,7 +11,7 @@ Deps = ["my_library"]
 [Targets.my_binary_with_ext]
 Type = "binary"
 Srcs = ["example_srcs/main.c"]
-Deps = ["my_library", "heatshrink"]
+Deps = ["my_library", "heatshrink", "vulkan"]
 
 
 [Targets.glew]
@@ -28,3 +28,17 @@ Config = "make"
 OutStatic = ["libheatshrink_static.a"]
 OutDynamic = ["libheatshrink_dynamic.a"]
 IncludeDirs = ["."]
+
+[Targets.glfw]
+Type = "external"
+Git = "https://github.com/glfw/glfw.git"
+Hash = "7482de6071d21db77a7236155da44c172a7f6c9e"
+Config = "headeronly"
+IncludeDirs = ["include"]
+
+[Targets.vulkan]
+Type = "local"
+Location = "C:\\VulkanSDK\\1.2.148.1"
+IncludeDirs = ["Include"]
+LibDirs = ["Lib"]
+OutStatic = ["vulkan-1.lib"]

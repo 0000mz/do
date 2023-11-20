@@ -63,6 +63,9 @@ func NewCommandBuilder() *CommandBuilder {
 
 func (cmd *CommandBuilder) AddLibDir(libdirs ...string) *CommandBuilder {
 	for _, libdir := range libdirs {
+		if len(libdir) == 0 {
+			continue
+		}
 		cmd.libdirs[libdir] = true
 	}
 	return cmd
@@ -70,6 +73,9 @@ func (cmd *CommandBuilder) AddLibDir(libdirs ...string) *CommandBuilder {
 
 func (cmd *CommandBuilder) AddIncludeDirs(includedirs ...string) *CommandBuilder {
 	for _, includedir := range includedirs {
+		if len(includedir) == 0 {
+			continue
+		}
 		cmd.includedirs[includedir] = true
 	}
 	return cmd
@@ -77,6 +83,9 @@ func (cmd *CommandBuilder) AddIncludeDirs(includedirs ...string) *CommandBuilder
 
 func (cmd *CommandBuilder) AddSrcFiles(srcfiles ...string) *CommandBuilder {
 	for _, srcfile := range srcfiles {
+		if len(srcfile) == 0 {
+			continue
+		}
 		cmd.srcfiles[srcfile] = true
 	}
 	return cmd
@@ -84,6 +93,9 @@ func (cmd *CommandBuilder) AddSrcFiles(srcfiles ...string) *CommandBuilder {
 
 func (cmd *CommandBuilder) AddLibs(libnames ...string) *CommandBuilder {
 	for _, libname := range libnames {
+		if len(libname) == 0 {
+			continue
+		}
 		cmd.libs[libname] = true
 	}
 	return cmd
@@ -283,13 +295,6 @@ func apply[U any, V any](iterable []U, fx func(U) V) []V {
 	return v
 }
 
-func convert_path_to_artifact(path string) *Artifact {
-	return &Artifact{
-		Dir:   filepath.Dir(path),
-		Fname: filepath.Base(path),
-	}
-}
-
 func is_file(filename string) bool {
 	stat, err := os.Stat(filename)
 	if err != nil {
@@ -340,63 +345,14 @@ func create_git_pull_buildstep(t *TargetConfig) (*BuildSubStep, error) {
 	projname := filepath.Base(t.Git)
 	export_dir := filepath.Join(dctx.builddir_path, "external", fmt.Sprintf("%s-%s", projname, t.Hash))
 	bss := &BuildSubStep{
-		inputs:      []*Artifact{{Url: t.Git, Fname: t.Hash}},
-		outputs:     []*Artifact{{Dir: export_dir}},
+		inputs:      []*Artifact{create_git_input_artifact(t.Git, t.Hash)},
+		outputs:     []*Artifact{create_directory_artifact(export_dir)},
 		action_fn:   pull_git_action,
 		name:        t.Git,
+		identifier:  BuildId_GitPull,
 		action_type: "downloading",
 	}
 	return bss, nil
-}
-
-// Determine if the `target`'s artifacts need to be refreshed.
-// The artifacts need to be refreshed if the files it depends on have a different
-// hash compared to the file hashes in the `cache`.
-func compute_refresh(target *TargetConfig, cache *BuildCache) bool {
-	tcache, is_cached := cache.CachedTargets[target.Name]
-	if !is_cached {
-		return true
-	}
-
-	var files []string = append(target.Hdrs, target.Srcs...)
-	for _, filename := range files {
-		filehash, is_hashed := tcache.FileHashes[filename]
-		if !is_hashed {
-			return true
-		}
-		curr_md5, err := compute_md5(filename)
-		if err != nil {
-			// Couldnt compute md5 hash, so refresh the build.
-			return true
-		}
-		if !bytearr_equal(filehash, curr_md5) {
-			return true
-		}
-	}
-
-	// Check if the list of dependencies changed.
-	if len(target.Deps) != len(tcache.Target.Deps) {
-		return true
-	}
-	var cache_deps map[string]bool = make(map[string]bool)
-	for _, cdep := range tcache.Target.Deps {
-		cache_deps[cdep] = true
-	}
-	for _, depname := range target.Deps {
-		_, hasdep := cache_deps[depname]
-		if !hasdep {
-			return true
-		}
-	}
-
-	// Check if the artifacts exist.
-	for _, artifact := range tcache.Artifacts {
-		if !artifact.Exists() {
-			return true
-		}
-	}
-
-	return false
 }
 
 type TargetConfig struct {
@@ -432,6 +388,10 @@ type TargetConfig struct {
 	// be added to the compile commands of the target linking against this remote
 	// dependency.
 	IncludeDirs []string `json:"include_dirs"`
+	LibDirs     []string `json:"lib_dirs"`
+
+	// For local targets, specify the path to the local project.
+	Location string `json:"location"`
 
 	id string
 }
@@ -480,6 +440,8 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 		bs, err = t.binary_build_step(dctx)
 	case "external":
 		bs, err = t.external_build_step(dctx)
+	case "local":
+		bs, err = t.local_build_step(dctx)
 	default:
 		return nil, fmt.Errorf("unknown target type: %s", t.Type)
 	}
@@ -492,7 +454,18 @@ func (t *TargetConfig) ConstructBuildTree(dctx *DoContext, tp *TargetParser) (*B
 	}
 
 	// Check if any of the files this target depends on have changed.
-	bs.needs_refresh = compute_refresh(t, dctx.init_build_cache)
+	target_def, has_target_definition := target_definitions[t.Type]
+	bs.needs_refresh = true
+	if has_target_definition {
+		bs.needs_refresh = target_def.compute_build_step_refresh(t, dctx.init_build_cache)
+	}
+	if !bs.needs_refresh {
+		var substep *BuildSubStep = bs.steps
+		for substep != nil {
+			substep.needs_refresh = target_def.CheckBuildSubstepRefresh(substep.identifier, t)
+			substep = substep.next
+		}
+	}
 
 	bs.target_config = t
 	bs.dependants = deps_buildsteps
@@ -551,10 +524,11 @@ func NewBuildStep() *BuildStep {
 
 func (t *TargetConfig) binary_build_step(dctx *DoContext) (*BuildStep, error) {
 	binfils_bs := &BuildSubStep{
-		inputs:      apply(t.Srcs, convert_path_to_artifact),
-		outputs:     []*Artifact{{Dir: dctx.builddir_path, Fname: t.Name}},
+		inputs:      apply(t.Srcs, create_file_artifact),
+		outputs:     []*Artifact{create_file_artifact_parts(dctx.builddir_path, t.Name)},
 		action_fn:   build_binary_action,
 		name:        t.Name,
+		identifier:  BuildId_CompileBin,
 		action_type: "compiling",
 	}
 
@@ -571,19 +545,21 @@ func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
 
 	var objfile string = fmt.Sprintf("%s.o", t.Name)
 	objfile_bss := &BuildSubStep{
-		inputs:      apply(t.Srcs, convert_path_to_artifact),
-		outputs:     []*Artifact{{Dir: dctx.builddir_path, Fname: objfile}},
+		inputs:      apply(t.Srcs, create_file_artifact),
+		outputs:     []*Artifact{create_file_artifact_parts(dctx.builddir_path, objfile)},
 		action_fn:   build_object_action,
 		name:        objfile,
+		identifier:  BuildId_CompileObj,
 		action_type: "compiling",
 	}
 
 	var libname string = fmt.Sprintf("%s.a", t.Name)
 	libfile_bss := &BuildSubStep{
 		inputs:      objfile_bss.outputs,
-		outputs:     []*Artifact{{Dir: dctx.builddir_path, Fname: libname}},
+		outputs:     []*Artifact{create_file_artifact_parts(dctx.builddir_path, libname)},
 		action_fn:   produce_static_lib_action,
 		name:        libname,
+		identifier:  BuildId_CreateStaticLib,
 		action_type: "linking",
 	}
 	objfile_bss.next = libfile_bss
@@ -592,6 +568,13 @@ func (t *TargetConfig) static_build_step(dctx *DoContext) (*BuildStep, error) {
 	bs.steps = objfile_bss
 
 	return bs, nil
+}
+
+func get_target_outlib_arifacts(t *TargetConfig) []*Artifact {
+	return apply(
+		append(t.OutStatic, t.OutDynamic...),
+		create_vague_file_artifact,
+	)
 }
 
 func (t *TargetConfig) external_build_step(dctx *DoContext) (*BuildStep, error) {
@@ -608,32 +591,93 @@ func (t *TargetConfig) external_build_step(dctx *DoContext) (*BuildStep, error) 
 		return nil, fmt.Errorf("no config provided for external build")
 	}
 
-	external_build_action_fn, has_build_config := external_build_steps[t.Config]
+	build_config, err := get_external_build_config_type(t.Config)
+	if err != nil {
+		return nil, err
+	}
+	external_build_action_fn, has_build_config := external_build_steps[build_config]
 	if !has_build_config {
-		return nil, fmt.Errorf("build config not found for \"%s\": external build configs provided are %#v", t.Config, get_all_all_external_build_configs())
+		return nil, fmt.Errorf("build config not found for \"%s\"", t.Config)
 	}
 
 	if len(git_pull_bss.outputs) != 1 {
 		panic("git pull build step should only have 1 output")
 	}
 
-	var project_pulldir string = git_pull_bss.outputs[0].Dir
+	dirart, is_dirart := git_pull_bss.outputs[0].Get().(*DirectoryArtifact)
+	if !is_dirart {
+		panic("expected external build artifact as first output")
+	}
+
+	var project_pulldir string = dirart.Dir
 	external_build_bss := &BuildSubStep{
-		inputs: []*Artifact{{Dir: project_pulldir, Fname: t.Config}},
-		outputs: apply(
-			append(t.OutStatic, t.OutDynamic...),
-			func(static_lib string) *Artifact { return &Artifact{Fname: static_lib} },
-		),
+		inputs:  []*Artifact{create_external_build_artifact(project_pulldir, build_config)},
+		outputs: get_target_outlib_arifacts(t),
 		action_fn: func(bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
 			return external_build_action_fn(project_pulldir, bs, bss, dc)
 		},
 		action_type: "building",
 		name:        fmt.Sprintf("running %s on %s", t.Config, t.Name),
+		identifier:  BuildId_ExternalBuild,
 	}
 	git_pull_bss.next = external_build_bss
 
 	bs := NewBuildStep()
 	bs.steps = git_pull_bss
+	return bs, nil
+}
+
+func (t *TargetConfig) local_build_step(dctx *DoContext) (*BuildStep, error) {
+
+	local_repo_bss := &BuildSubStep{
+		inputs:      []*Artifact{},
+		outputs:     get_target_outlib_arifacts(t),
+		action_type: "importing",
+		name:        fmt.Sprintf("local library %s", t.Name),
+		identifier:  BuildId_LocalBuild,
+		action_fn: func(bs *BuildStep, bss *BuildSubStep, dc *DoContext) (*bytes.Buffer, error) {
+			var proj_location string = t.Location
+			if stat, err := os.Stat(proj_location); err != nil || !stat.IsDir() {
+				return nil, fmt.Errorf("invalid directory: %s", proj_location)
+			}
+
+			// Set the output libs
+			var libout map[string]string = make(map[string]string)
+			for _, libname := range append(t.OutDynamic, t.OutStatic...) {
+				libout[libname] = ""
+			}
+
+			for _, libdir := range t.LibDirs {
+				full_libdir := filepath.Join(proj_location, libdir)
+				for libfile := range libout {
+					full_libpath := filepath.Join(full_libdir, libfile)
+
+					logger.Debug().Msgf("DBG libpath: %s", full_libpath)
+					stat, err := os.Stat(full_libpath)
+					if err == nil && !stat.IsDir() {
+						libout[libfile] = full_libpath
+					}
+				}
+			}
+
+			for libname, libpath := range libout {
+				// Check if any libs could not be found.
+				if len(libpath) == 0 {
+					return nil, fmt.Errorf("failed to find lib: %s", libname)
+				}
+
+				// Add an output artifact for this build sub step
+				bss.outputs = append(bss.outputs, create_file_artifact_parts(filepath.Dir(libpath), libname))
+			}
+
+			set_include_dirs(proj_location, bs, bss)
+			return nil, nil
+		},
+	}
+
+	bs := NewBuildStep()
+	bs.steps = local_repo_bss
+
 	return bs, nil
 }
 
@@ -699,9 +743,13 @@ type BuildSubStep struct {
 	// This is used for logging the actions taking place.
 	name        string
 	action_type string
+	// This identifier must be unique within a build step's set of build sub-steps.
+	identifier BuildIdentifier
 
 	action_fn func(*BuildStep, *BuildSubStep, *DoContext) (*bytes.Buffer, error)
 	next      *BuildSubStep
+	// Similar to BuildStep.needs_refresh, but for the sub step.
+	needs_refresh bool
 }
 
 func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) (*bytes.Buffer, error) {
@@ -716,27 +764,6 @@ func (bss *BuildSubStep) Build(bs *BuildStep, dctx *DoContext) (*bytes.Buffer, e
 
 	stderr, err := bss.action_fn(bs, bss, dctx)
 	return stderr, err
-}
-
-// An artifact is a product of a build step.
-type Artifact struct {
-	// The directory that the artifact is stored in.
-	Dir string `json:"dir"`
-	// The filename of the artifact within the directory.
-	Fname string `json:"fname"`
-	// The url where the artifact lives.
-	Url string `json:"url"`
-	// Headers can be exported from a target to be used in its dependant.
-	IncludeDir string `json:"header_dir"`
-}
-
-func (a *Artifact) Exists() bool {
-	_, err := os.Stat(a.Fullpath())
-	return err == nil
-}
-
-func (a *Artifact) Fullpath() string {
-	return filepath.Join(a.Dir, a.Fname)
 }
 
 // Build step define how to build a specific transition unit
@@ -822,10 +849,11 @@ func (bs *BuildStep) Build(dctx *DoContext, errch chan error, stderrch chan *byt
 		}
 		bs.build_complete = true
 
-		cache_target := &TargetCache{
+		cache_target := &BuildStepCache{
 			Target:     bs.target_config,
 			FileHashes: hashes,
 			Artifacts:  bs.output_artifacts,
+			SubSteps:   []*BuildSubStepCache{},
 		}
 
 		dctx.end_build_cache.CachedTargets[bs.target_config.Name] = cache_target
@@ -999,11 +1027,11 @@ func NewGccToolchain() *Toolchain {
 		}
 
 		for _, artifact := range artifacts {
-			if len(artifact.Fname) > 0 {
-				cmdb = cmdb.AddLibDir(artifact.Dir).AddLibs(artifact.Fname)
+			if fa, is_fa := artifact.Get().(*FileArtifact); is_fa && len(fa.Fname) > 0 {
+				cmdb = cmdb.AddLibDir(fa.Dir).AddLibs(fa.Fname)
 			}
-			if len(artifact.IncludeDir) > 0 {
-				cmdb = cmdb.AddIncludeDirs(artifact.IncludeDir)
+			if da, is_da := artifact.Get().(*DirectoryArtifact); is_da && len(da.Dir) > 0 {
+				cmdb = cmdb.AddIncludeDirs(da.Dir)
 			}
 		}
 		return cmdb
@@ -1015,37 +1043,70 @@ func NewGccToolchain() *Toolchain {
 			// TODO: Appending exe to the produced binary so that windows will know how to handle the file.
 			// This is not portable and is only windows specific. Abstract this away so that the filename
 			// decision is more intuitive based on the operating system and the type of object being built.
-			exepath := fmt.Sprintf("%s.exe", outbin.Fullpath())
+			exepath := fmt.Sprintf("%s.exe", outbin.Get().(*FileArtifact).Fullpath())
 
 			cmdb := NewCommandBuilder().
 				AddCompiler("gcc").
 				AddOutput(exepath).
-				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string {
+					fa, is_fa := a.Get().(*FileArtifact)
+					if !is_fa {
+						return ""
+					}
+					return fa.Fullpath()
+				})...)
 
 			cmdb = apply_common_args(bs, cmdb)
 			return cmdb.Build(BuildModeExe, dctx.compile_database)
 		},
 		compile_object_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
 
-			outobj := bss.outputs[0]
+			outobj, is_fa := bss.outputs[0].Get().(*FileArtifact)
+			if !is_fa {
+				panic("expected output of object compile to be a file artifact")
+			}
+
 			cmdb := NewCommandBuilder().
 				AddCompiler("gcc").
 				AddOutput(outobj.Fullpath()).
-				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+				AddSrcFiles(apply(bss.inputs, func(a *Artifact) string {
+					fa, is_fa := a.Get().(*FileArtifact)
+					if !is_fa {
+						return ""
+					}
+					return fa.Fullpath()
+				})...)
 
 			cmdb = apply_common_args(bs, cmdb)
 			return cmdb.Build(BuildModeCompile, dctx.compile_database)
 		},
 		build_static_lib_cmd_fn: func(dctx *DoContext, bs *BuildStep, bss *BuildSubStep) []string {
-			var outlib *Artifact = bss.outputs[0]
+			outlib, outlib_is_fa := bss.outputs[0].Get().(*FileArtifact)
+			if !outlib_is_fa {
+				panic("expected outlib to be a file artifact")
+			}
 			cmd := []string{"ar", "rcs", outlib.Fullpath()}
-			cmd = append(cmd, apply(bss.inputs, func(a *Artifact) string { return a.Fullpath() })...)
+			cmd = append(cmd,
+				filter(
+					apply(bss.inputs, func(a *Artifact) string {
+						fa, is_fa := a.Get().(*FileArtifact)
+						if !is_fa {
+							return ""
+						}
+						return fa.Fullpath()
+					}), func(file string) bool {
+						// filter out empty filepaths
+						return len(file) > 0
+					})...)
 			return cmd
 		},
 	}
 }
 
-type TargetCache struct {
+type BuildSubStepCache struct {
+}
+
+type BuildStepCache struct {
 	Target *TargetConfig `json:"target"`
 	// For each file defined in the target config store the md5 hash for the file
 	// when it was last built. This should be used to compare against to determine
@@ -1053,6 +1114,8 @@ type TargetCache struct {
 	FileHashes map[string][]byte `json:"file-hashes"`
 	// Cthe location of artifacts produced by the target.
 	Artifacts []*Artifact `json:"artifacts"`
+	// Either full steps can be cached or sub steps can be cached.
+	SubSteps []*BuildSubStepCache `json:"sub_steps"`
 }
 
 // The build cache stores information about the targets that were built and
@@ -1060,7 +1123,7 @@ type TargetCache struct {
 // in future builds whether or not a target should be rebuilt and where to find the
 // cached artifacts.
 type BuildCache struct {
-	CachedTargets map[string]*TargetCache `json:"cached-targets"`
+	CachedTargets map[string]*BuildStepCache `json:"cached-targets"`
 }
 
 func ensure_dir(dirname string) {
@@ -1073,7 +1136,7 @@ func ensure_dir(dirname string) {
 
 func NewBuildCache() *BuildCache {
 	return &BuildCache{
-		CachedTargets: make(map[string]*TargetCache, 0),
+		CachedTargets: make(map[string]*BuildStepCache, 0),
 	}
 }
 

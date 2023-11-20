@@ -21,8 +21,8 @@ func TestPullGitAction(t *testing.T) {
 	}()
 
 	bss := BuildSubStep{
-		inputs:  []*Artifact{{Url: github_repo, Fname: hash}},
-		outputs: []*Artifact{{Dir: outdir}},
+		inputs:  []*Artifact{create_git_input_artifact(github_repo, hash)},
+		outputs: []*Artifact{create_directory_artifact(outdir)},
 	}
 	bs := BuildStep{
 		steps: &bss,
