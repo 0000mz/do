@@ -40,7 +40,7 @@ type CompileCommandsDatabase struct {
 type CompileCommandEntry struct {
 	Directory string   `json:"directory"`
 	Arguments []string `json:"arguments"`
-	File      []string `json:"file"`
+	File      string   `json:"file"`
 }
 
 type CommandBuilder struct {
@@ -140,7 +140,6 @@ func (cmd *CommandBuilder) Build(mode BuildMode, compiledb *CompileCommandsDatab
 	cmdlst = append(cmdlst, cmd.outfile)
 	for inputfile := range cmd.srcfiles {
 		cmdlst = append(cmdlst, inputfile)
-		comp_entry.File = append(comp_entry.File, inputfile)
 	}
 	for includedir := range cmd.includedirs {
 		cmdlst = append(cmdlst, "-I", includedir)
@@ -154,7 +153,12 @@ func (cmd *CommandBuilder) Build(mode BuildMode, compiledb *CompileCommandsDatab
 
 	// Update the compile database with this command.
 	comp_entry.Arguments = cmdlst
-	compiledb.Commands = append(compiledb.Commands, &comp_entry)
+	// Copy the compile commands entry for each file in this build
+	for inputfile := range cmd.srcfiles {
+		curr_entry := comp_entry
+		curr_entry.File = inputfile
+		compiledb.Commands = append(compiledb.Commands, &curr_entry)
+	}
 	return cmdlst
 }
 
